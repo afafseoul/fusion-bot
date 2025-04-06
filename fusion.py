@@ -1,34 +1,17 @@
 from flask import Flask, request, jsonify
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
-import os
-import random
-import subprocess
-import io
 
 app = Flask(__name__)
 
 SCOPES = ['https://www.googleapis.com/auth/drive']
 SERVICE_ACCOUNT_FILE = 'credentials.json'
-credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-drive_service = build('drive', 'v3', credentials=credentials)
 
-# Trouver l'ID du dossier du client
-def get_folder_id(parent_id, folder_name):
-    query = f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and name='{folder_name}'"
-    response = drive_service.files().list(q=query, fields="files(id)").execute()
-    folders = response.get('files', [])
-    return folders[0]['id'] if folders else None
-
-# Télécharger fichier depuis Drive
-def download_file(file_id, filepath):
-    request = drive_service.files().get_media(fileId=file_id)
-    fh = io.FileIO(filepath, 'wb')
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
+def connect_drive():
+    credentials = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE, scopes=SCOPES
+    )
+    return build('drive', 'v3', credentials=credentials)
 
 @app.route('/', methods=['GET'])
 def index():
@@ -36,57 +19,52 @@ def index():
 
 @app.route('/start', methods=['POST'])
 def start_fusion():
+    data = request.get_json()
+    client_name = data.get("client")
+    video_name = data.get("video_name")
+
+    if not client_name or not video_name:
+        return jsonify({"status": "error", "message": "Missing client or video_name"}), 400
+
     try:
-        data = request.get_json()
-        client = data["client"]
-        video_name = data["video_name"]
+        service = connect_drive()
 
-        MAIN_FOLDER_ID = '1cXn22CJ8YIMftyARZclmJiMC4pSybOHE'
+        # Récupère le dossier client par son nom
+        folder_query = f"name = '{client_name}' and mimeType = 'application/vnd.google-apps.folder'"
+        folder_result = service.files().list(q=folder_query, spaces='drive').execute()
+        folder_files = folder_result.get('files', [])
 
-        client_folder_id = get_folder_id(MAIN_FOLDER_ID, client)
-        videos_folder_id = get_folder_id(client_folder_id, 'Post-Video-AddMusic')
-        musique_folder_id = get_folder_id(client_folder_id, 'Musique')
-        ready_folder_id = get_folder_id(client_folder_id, 'ReadyToPost')
+        if not folder_files:
+            return jsonify({"status": "error", "message": "Client folder not found"}), 404
 
-        # Télécharger vidéo depuis Drive
-        query_video = f"'{videos_folder_id}' in parents and name='{video_name}'"
-        video_result = drive_service.files().list(q=query_video, fields="files(id)").execute()
-        if not video_result['files']:
-            return jsonify({"error": "Vidéo introuvable"}), 404
-        video_id = video_result['files'][0]['id']
-        local_video_path = f"/tmp/{video_name}"
-        download_file(video_id, local_video_path)
+        client_folder_id = folder_files[0]['id']
 
-        # Choisir et télécharger une musique aléatoire
-        musiques_result = drive_service.files().list(q=f"'{musique_folder_id}' in parents", fields="files(id, name)").execute()
-        musique = random.choice(musiques_result['files'])
-        local_music_path = f"/tmp/{musique['name']}"
-        download_file(musique['id'], local_music_path)
+        # Récupère le sous-dossier "Post-Video-AddMusic"
+        add_music_query = f"'{client_folder_id}' in parents and name='Post-Video-AddMusic' and mimeType='application/vnd.google-apps.folder'"
+        add_music_folder_result = service.files().list(q=add_music_query, spaces='drive').execute()
+        add_music_files = add_music_folder_result.get('files', [])
 
-        # Extraction du timing depuis nom du fichier musique
-        music_start = 0
-        if "@" in musique['name']:
-            music_start = int(musique['name'].split("@")[1].split(".")[0])
+        if not add_music_files:
+            return jsonify({"status": "error", "message": "Subfolder 'Post-Video-AddMusic' not found"}), 404
 
-        # Fusion via FFmpeg
-        output_filename = f"fused_{video_name}"
-        output_filepath = f"/tmp/{output_filename}"
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-i", local_video_path,
-            "-ss", str(music_start), "-i", local_music_path,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "copy",
-            "-shortest",
-            output_filepath
-        ], check=True)
+        add_music_folder_id = add_music_files[0]['id']
 
-        # Upload résultat sur Drive dans ReadyToPost
-        media = MediaFileUpload(output_filepath, mimetype='video/mp4')
-        file_metadata = {'name': output_filename, 'parents': [ready_folder_id]}
-        drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        # Vérifie si la vidéo existe bien dans "Post-Video-AddMusic"
+        video_query = f"name='{video_name}' and '{add_music_folder_id}' in parents"
+        video_result = service.files().list(q=video_query, spaces='drive').execute()
+        video_files = video_result.get('files', [])
 
-        return jsonify({"message": "✅ Fusion réussie et vidéo uploadée"}), 200
+        if not video_files:
+            return jsonify({"status": "error", "message": "Video not found"}), 404
+
+        # Ici, tu pourras lancer ton processus de traitement vidéo/audio avec FFmpeg
+        # Cette étape est juste une validation initiale.
+        # Pour l'instant, je renvoie juste un message de validation :
+        
+        return jsonify({"status": "success", "message": "Connected and validated. Ready for processing."})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(debug=True)
