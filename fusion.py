@@ -1,17 +1,12 @@
-from flask import Flask, request, jsonify
+-from flask import Flask, request, jsonify
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+import os
 
 app = Flask(__name__)
 
 SCOPES = ['https://www.googleapis.com/auth/drive']
 SERVICE_ACCOUNT_FILE = 'credentials.json'
-
-def connect_drive():
-    credentials = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SCOPES
-    )
-    return build('drive', 'v3', credentials=credentials)
 
 @app.route('/', methods=['GET'])
 def index():
@@ -19,52 +14,36 @@ def index():
 
 @app.route('/start', methods=['POST'])
 def start_fusion():
-    data = request.get_json()
-    client_name = data.get("client")
-    video_name = data.get("video_name")
-
-    if not client_name or not video_name:
-        return jsonify({"status": "error", "message": "Missing client or video_name"}), 400
-
     try:
-        service = connect_drive()
+        # Extraction JSON du corps de la requête
+        data = request.get_json(force=True)
 
-        # Récupère le dossier client par son nom
-        folder_query = f"name = '{client_name}' and mimeType = 'application/vnd.google-apps.folder'"
-        folder_result = service.files().list(q=folder_query, spaces='drive').execute()
-        folder_files = folder_result.get('files', [])
+        # Vérifie que les champs requis sont présents
+        client = data['client']
+        video_name = data['video_name']
 
-        if not folder_files:
-            return jsonify({"status": "error", "message": "Client folder not found"}), 404
+        # Connexion à Google Drive
+        credentials = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES
+        )
+        drive_service = build('drive', 'v3', credentials=credentials)
 
-        client_folder_id = folder_files[0]['id']
+        # Test basique : Lister les fichiers dans SOCIAL POSTING/client
+        parent_folder = "SOCIAL POSTING"
+        response = drive_service.files().list(
+            q=f"name='{client}' and mimeType='application/vnd.google-apps.folder'",
+            spaces='drive'
+        ).execute()
 
-        # Récupère le sous-dossier "Post-Video-AddMusic"
-        add_music_query = f"'{client_folder_id}' in parents and name='Post-Video-AddMusic' and mimeType='application/vnd.google-apps.folder'"
-        add_music_folder_result = service.files().list(q=add_music_query, spaces='drive').execute()
-        add_music_files = add_music_folder_result.get('files', [])
+        folders = response.get('files', [])
+        if not folders:
+            return jsonify({"status": "error", "message": "Client folder not found."}), 404
 
-        if not add_music_files:
-            return jsonify({"status": "error", "message": "Subfolder 'Post-Video-AddMusic' not found"}), 404
+        client_folder_id = folders[0]['id']
 
-        add_music_folder_id = add_music_files[0]['id']
+        return jsonify({"status": "success", "message": f"Connected. Folder ID: {client_folder_id}"}), 200
 
-        # Vérifie si la vidéo existe bien dans "Post-Video-AddMusic"
-        video_query = f"name='{video_name}' and '{add_music_folder_id}' in parents"
-        video_result = service.files().list(q=video_query, spaces='drive').execute()
-        video_files = video_result.get('files', [])
-
-        if not video_files:
-            return jsonify({"status": "error", "message": "Video not found"}), 404
-
-        # Ici, tu pourras lancer ton processus de traitement vidéo/audio avec FFmpeg
-        # Cette étape est juste une validation initiale.
-        # Pour l'instant, je renvoie juste un message de validation :
-        
-        return jsonify({"status": "success", "message": "Connected and validated. Ready for processing."})
-
+    except KeyError as e:
+        return jsonify({"status": "error", "message": f"Missing parameter: {str(e)}"}), 400
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-if __name__ == "__main__":
-    app.run(debug=True)
+        return jsonify({"status": "error", "message": f"Server error: {str(e)}"}), 500
