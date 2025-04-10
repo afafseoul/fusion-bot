@@ -6,9 +6,10 @@ import traceback
 
 app = Flask(__name__)
 
+# CONFIG
 SCOPES = ['https://www.googleapis.com/auth/drive']
 SERVICE_ACCOUNT_FILE = 'credentials.json'
-SOCIAL_POSTING_FOLDER_ID = '1cXn22CJ8YIMftyARZClmJiMC4pSybOHE'  # ID du dossier SOCIAL POSTING
+SOCIAL_POSTING_FOLDER_ID = '1cXn22CJ8YIMftyARZClmJiMC4pSybOHE'  # ID du dossier "SOCIAL POSTING"
 
 @app.route('/', methods=['GET'])
 def index():
@@ -26,9 +27,9 @@ def start_fusion():
         client = data['client']
         video_name = data['video_name']
 
-        print(f"🔎 Recherche du dossier pour le client '{client}'...")
+        print(f"🔍 Recherche du dossier pour le client '{client}'...")
 
-        # Connexion à Google Drive
+        # Connexion Google Drive
         credentials = service_account.Credentials.from_service_account_file(
             SERVICE_ACCOUNT_FILE, scopes=SCOPES
         )
@@ -46,7 +47,14 @@ def start_fusion():
         client_folder_id = folders[0]['id']
         print(f"✅ Dossier client trouvé : {client_folder_id}")
 
-        return jsonify({"status": "success", "message": "Connected", "folder_id": client_folder_id}), 200
+        # Ici tu pourras rajouter tout le reste de ton process (récupérer vidéo, musique, fusionner, déposer)
+        # Tu peux renvoyer client_folder_id + confirmation
+
+        return jsonify({
+            "status": "success",
+            "message": f"Client folder ID: {client_folder_id}",
+            "folder_id": client_folder_id
+        }), 200
 
     except Exception as e:
         print("❌ Exception capturée :", traceback.format_exc())
