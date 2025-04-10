@@ -1,10 +1,11 @@
-from flask import Flask, request, jsonify
+ from flask import Flask, request, jsonify
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 import os
 import random
 import ffmpeg
+import traceback
 
 app = Flask(__name__)
 
@@ -24,9 +25,20 @@ def start():
         print("\n📥 Requête reçue...")
         print(f"✅ Données JSON reçues : {data}")
 
-        creds = service_account.Credentials.from_service_account_file("/etc/secrets/credentials.json", scopes=SCOPES)
-        drive_service = build("drive", "v3", credentials=creds)
-        print("✅ Connexion à Google Drive réussie")
+        try:
+            creds = service_account.Credentials.from_service_account_file(
+                "/etc/secrets/credentials.json", scopes=SCOPES
+            )
+            drive_service = build("drive", "v3", credentials=creds)
+            print("✅ Connexion à Google Drive réussie")
+        except FileNotFoundError:
+            return jsonify({"error": "Fichier credentials.json introuvable sur Render"}), 500
+        except ValueError as e:
+            return jsonify({"error": f"Erreur de format dans credentials.json : {e}"}), 500
+        except Exception as e:
+            if "invalid_grant" in str(e):
+                return jsonify({"error": "Clé invalide : vérifie la date de création ou si elle est désactivée"}), 401
+            return jsonify({"error": f"Erreur inattendue avec les identifiants : {str(e)}"}), 500
 
         # Recherche du dossier client
         response = drive_service.files().list(
@@ -126,7 +138,8 @@ def start():
         return jsonify({"status": "ok"})
 
     except Exception as e:
-        print(f"🚨 ERREUR : {e}")
+        print("🚨 ERREUR :")
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
