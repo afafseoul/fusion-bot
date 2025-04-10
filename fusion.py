@@ -1,107 +1,96 @@
-# === PARAMÈTRES ===
-music_folder_name = "Music"
-ready_to_post_folder_name = "ReadyToPost"
+from flask import Flask, request, jsonify
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+import random
+import os
 
-# === TROUVER LA VIDÉO ===
-video_files = drive_service.files().list(
-    q=f"'{client_folder_id}' in parents and name = '{video_name}' and trashed = false",
-    fields="files(id, name)"
-).execute().get("files", [])
+app = Flask(__name__)
 
-if not video_files:
-    return jsonify({"error": f"Vidéo '{video_name}' introuvable"}), 404
+SCOPES = ['https://www.googleapis.com/auth/drive']
+SERVICE_ACCOUNT_FILE = 'credentials.json'
 
-video_file = video_files[0]
-video_file_id = video_file["id"]
+@app.route('/', methods=['GET'])
+def index():
+    return "✅ Fusion Bot is running!"
 
-# === TROUVER LE DOSSIER MUSIC ===
-music_folders = drive_service.files().list(
-    q=f"'{client_folder_id}' in parents and name = '{music_folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-    fields="files(id, name)"
-).execute().get("files", [])
+@app.route('/start', methods=['POST'])
+def start():
+    try:
+        data = request.get_json(force=True)
+        client = data['client']
+        video_name = data['video_name']
+        print("📥 Requête reçue...")
+        print(f"✅ Données JSON reçues : {data}")
+        print(f"🔍 Recherche du dossier du client '{client}' dans SOCIAL POSTING...")
 
-if not music_folders:
-    return jsonify({"error": "Dossier 'Music' introuvable"}), 404
+        credentials = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES
+        )
+        drive_service = build('drive', 'v3', credentials=credentials)
+        print("✅ Connexion à Google Drive réussie")
 
-music_folder_id = music_folders[0]["id"]
+        # 1. Récupérer le dossier 'SOCIAL POSTING'
+        main_folder_id = '1cXn22CJ8YlMftyARZcImJiMC4pSybOHE'
 
-# === TROUVER UNE MUSIQUE (n'importe laquelle pour l’instant) ===
-music_files = drive_service.files().list(
-    q=f"'{music_folder_id}' in parents and trashed = false and mimeType contains 'audio'",
-    fields="files(id, name)"
-).execute().get("files", [])
+        # 2. Trouver le dossier du client
+        response = drive_service.files().list(
+            q=f"name='{client}' and mimeType='application/vnd.google-apps.folder' and '{main_folder_id}' in parents",
+            spaces='drive',
+            fields='files(id, name)'
+        ).execute()
+        folders = response.get('files', [])
 
-if not music_files:
-    return jsonify({"error": "Aucune musique trouvée dans 'Music'"}), 404
+        if not folders:
+            return jsonify({"error": f"Dossier client '{client}' introuvable"}), 404
 
-music_file = random.choice(music_files)
-music_name = music_file["name"]
-music_file_id = music_file["id"]
+        client_folder_id = folders[0]['id']
+        print(f"📁 Dossier du client trouvé : {client_folder_id}")
 
-# === EXTRAIRE LE DÉCALAGE TEMPOREL DEPUIS LE NOM DE LA MUSIQUE ===
-import re
-match = re.search(r'@(\d+)', music_name)
-start_offset = int(match.group(1)) if match else 0
+        # 3. Trouver la vidéo dans /Post-Video-AddMusic/
+        video_response = drive_service.files().list(
+            q=f"name='{video_name}' and '{client_folder_id}' in parents",
+            spaces='drive',
+            fields='files(id, name)'
+        ).execute()
+        video_files = video_response.get('files', [])
 
-# === TÉLÉCHARGER LA VIDÉO ET LA MUSIQUE ===
-from pathlib import Path
+        if not video_files:
+            return jsonify({"error": f"Vidéo '{video_name}' introuvable"}), 404
 
-temp_video_path = "/tmp/video.mp4"
-temp_music_path = "/tmp/music.mp3"
-final_output_path = "/tmp/output.mp4"
+        video_id = video_files[0]['id']
+        print(f"🎥 Vidéo trouvée : {video_name} (ID: {video_id})")
 
-with open(temp_video_path, "wb") as f:
-    f.write(drive_service.files().get_media(fileId=video_file_id).execute())
+        # 4. Sélectionner une musique aléatoire dans le dossier /Music/
+        music_folder_response = drive_service.files().list(
+            q=f"name='Music' and '{client_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
+            spaces='drive',
+            fields='files(id, name)'
+        ).execute()
+        music_folders = music_folder_response.get('files', [])
 
-with open(temp_music_path, "wb") as f:
-    f.write(drive_service.files().get_media(fileId=music_file_id).execute())
+        if not music_folders:
+            return jsonify({"error": "Dossier Music introuvable"}), 404
 
-# === FUSION VIA FFMPEG ===
-import subprocess
+        music_folder_id = music_folders[0]['id']
+        music_files = drive_service.files().list(
+            q=f"'{music_folder_id}' in parents and mimeType contains 'audio/'",
+            spaces='drive',
+            fields='files(id, name)'
+        ).execute().get('files', [])
 
-cmd = [
-    "ffmpeg", "-y",
-    "-i", temp_video_path,
-    "-ss", str(start_offset),
-    "-i", temp_music_path,
-    "-map", "0:v:0", "-map", "1:a:0",
-    "-c:v", "copy",
-    "-shortest",
-    final_output_path
-]
+        if not music_files:
+            return jsonify({"error": "Aucune musique disponible"}), 404
 
-subprocess.run(cmd, check=True)
+        music_choice = random.choice(music_files)
+        print(f"🎵 Musique sélectionnée : {music_choice['name']}")
 
-# === TROUVER / CRÉER DOSSIER ReadyToPost ===
-ready_folders = drive_service.files().list(
-    q=f"'{client_folder_id}' in parents and name = '{ready_to_post_folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-    fields="files(id, name)"
-).execute().get("files", [])
+        # 👉 Ici tu ajouteras l’appel à FFmpeg ou Colab si besoin pour fusionner
+        return jsonify({
+            "status": "success",
+            "message": f"Fusion possible pour {video_name} avec la musique {music_choice['name']}"
+        }), 200
 
-if ready_folders:
-    ready_folder_id = ready_folders[0]["id"]
-else:
-    ready_folder = drive_service.files().create(
-        body={
-            "name": ready_to_post_folder_name,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [client_folder_id]
-        },
-        fields="id"
-    ).execute()
-    ready_folder_id = ready_folder["id"]
-
-# === UPLOAD DU FICHIER FINAL ===
-from googleapiclient.http import MediaFileUpload
-
-final_filename = f"fusion-{video_name}"
-media = MediaFileUpload(final_output_path, resumable=True, mimetype="video/mp4")
-
-drive_service.files().create(
-    body={
-        "name": final_filename,
-        "parents": [ready_folder_id],
-        "mimeType": "video/mp4"
-    },
-    media_body=media
-).execute()
+    except KeyError as e:
+        return jsonify({"error": f"Paramètre manquant : {str(e)}"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Erreur serveur : {str(e)}"}), 500
