@@ -1,86 +1,107 @@
-from flask import Flask, request, jsonify
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-import os
-import traceback
+# === PARAMÈTRES ===
+music_folder_name = "Music"
+ready_to_post_folder_name = "ReadyToPost"
 
-app = Flask(__name__)
+# === TROUVER LA VIDÉO ===
+video_files = drive_service.files().list(
+    q=f"'{client_folder_id}' in parents and name = '{video_name}' and trashed = false",
+    fields="files(id, name)"
+).execute().get("files", [])
 
-SCOPES = ['https://www.googleapis.com/auth/drive']
-SERVICE_ACCOUNT_FILE = 'credentials.json'
+if not video_files:
+    return jsonify({"error": f"Vidéo '{video_name}' introuvable"}), 404
 
-SOCIAL_POSTING_ID = "1cXn22CJ8YlMftyARZcImJiMC4pSybOHE"
+video_file = video_files[0]
+video_file_id = video_file["id"]
 
-@app.route('/', methods=['GET'])
-def home():
-    return "✅ Fusion Bot is alive"
+# === TROUVER LE DOSSIER MUSIC ===
+music_folders = drive_service.files().list(
+    q=f"'{client_folder_id}' in parents and name = '{music_folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+    fields="files(id, name)"
+).execute().get("files", [])
 
-@app.route('/start', methods=['POST'])
-def start():
-    try:
-        print("📥 Requête reçue...")
+if not music_folders:
+    return jsonify({"error": "Dossier 'Music' introuvable"}), 404
 
-        # Étape 1 : lecture JSON
-        try:
-            data = request.get_json(force=True)
-            print("✅ Données JSON reçues :", data)
-        except Exception as e:
-            print("❌ JSON invalide")
-            return jsonify({"status": "error", "message": "JSON mal formé", "details": str(e)}), 400
+music_folder_id = music_folders[0]["id"]
 
-        # Étape 2 : vérif des clés
-        client = data.get("client")
-        video_name = data.get("video_name")
-        if not client or not video_name:
-            print("❌ Paramètres manquants :", {"client": client, "video_name": video_name})
-            return jsonify({"status": "error", "message": "Paramètres 'client' ou 'video_name' manquants"}), 400
+# === TROUVER UNE MUSIQUE (n'importe laquelle pour l’instant) ===
+music_files = drive_service.files().list(
+    q=f"'{music_folder_id}' in parents and trashed = false and mimeType contains 'audio'",
+    fields="files(id, name)"
+).execute().get("files", [])
 
-        print(f"🔍 Recherche du dossier du client '{client}' dans SOCIAL POSTING...")
+if not music_files:
+    return jsonify({"error": "Aucune musique trouvée dans 'Music'"}), 404
 
-        # Étape 3 : auth Google Drive
-        try:
-            credentials = service_account.Credentials.from_service_account_file(
-                SERVICE_ACCOUNT_FILE, scopes=SCOPES
-            )
-            drive_service = build('drive', 'v3', credentials=credentials)
-            print("✅ Connexion à Google Drive réussie")
-        except Exception as e:
-            print("❌ Erreur d'authentification Google")
-            traceback.print_exc()
-            return jsonify({"status": "error", "message": "Échec connexion Google Drive", "details": str(e)}), 500
+music_file = random.choice(music_files)
+music_name = music_file["name"]
+music_file_id = music_file["id"]
 
-        # Étape 4 : recherche du dossier client
-        try:
-            response = drive_service.files().list(
-                q=f"name='{client}' and mimeType='application/vnd.google-apps.folder' and '{SOCIAL_POSTING_ID}' in parents",
-                spaces='drive',
-                fields='files(id, name)'
-            ).execute()
+# === EXTRAIRE LE DÉCALAGE TEMPOREL DEPUIS LE NOM DE LA MUSIQUE ===
+import re
+match = re.search(r'@(\d+)', music_name)
+start_offset = int(match.group(1)) if match else 0
 
-            folders = response.get('files', [])
-            if not folders:
-                print("❌ Dossier client introuvable dans SOCIAL POSTING")
-                return jsonify({
-                    "status": "error",
-                    "message": f"Dossier client '{client}' introuvable dans SOCIAL POSTING"
-                }), 404
+# === TÉLÉCHARGER LA VIDÉO ET LA MUSIQUE ===
+from pathlib import Path
 
-            client_folder_id = folders[0]['id']
-            print(f"✅ Dossier client trouvé : {client_folder_id}")
-        except Exception as e:
-            print("❌ Erreur lors de la recherche du dossier client")
-            traceback.print_exc()
-            return jsonify({"status": "error", "message": "Erreur lors de la recherche du dossier client", "details": str(e)}), 500
+temp_video_path = "/tmp/video.mp4"
+temp_music_path = "/tmp/music.mp3"
+final_output_path = "/tmp/output.mp4"
 
-        # ✅ Réponse finale (pour l’instant jusqu’ici)
-        return jsonify({
-            "status": "success",
-            "client": client,
-            "video_name": video_name,
-            "client_folder_id": client_folder_id
-        }), 200
+with open(temp_video_path, "wb") as f:
+    f.write(drive_service.files().get_media(fileId=video_file_id).execute())
 
-    except Exception as e:
-        print("💥 ERREUR INATTENDUE")
-        traceback.print_exc()
-        return jsonify({"status": "error", "message": "Erreur serveur inattendue", "details": str(e)}), 500
+with open(temp_music_path, "wb") as f:
+    f.write(drive_service.files().get_media(fileId=music_file_id).execute())
+
+# === FUSION VIA FFMPEG ===
+import subprocess
+
+cmd = [
+    "ffmpeg", "-y",
+    "-i", temp_video_path,
+    "-ss", str(start_offset),
+    "-i", temp_music_path,
+    "-map", "0:v:0", "-map", "1:a:0",
+    "-c:v", "copy",
+    "-shortest",
+    final_output_path
+]
+
+subprocess.run(cmd, check=True)
+
+# === TROUVER / CRÉER DOSSIER ReadyToPost ===
+ready_folders = drive_service.files().list(
+    q=f"'{client_folder_id}' in parents and name = '{ready_to_post_folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+    fields="files(id, name)"
+).execute().get("files", [])
+
+if ready_folders:
+    ready_folder_id = ready_folders[0]["id"]
+else:
+    ready_folder = drive_service.files().create(
+        body={
+            "name": ready_to_post_folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [client_folder_id]
+        },
+        fields="id"
+    ).execute()
+    ready_folder_id = ready_folder["id"]
+
+# === UPLOAD DU FICHIER FINAL ===
+from googleapiclient.http import MediaFileUpload
+
+final_filename = f"fusion-{video_name}"
+media = MediaFileUpload(final_output_path, resumable=True, mimetype="video/mp4")
+
+drive_service.files().create(
+    body={
+        "name": final_filename,
+        "parents": [ready_folder_id],
+        "mimeType": "video/mp4"
+    },
+    media_body=media
+).execute()
