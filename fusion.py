@@ -55,7 +55,7 @@ def start():
 
         # Recherche du sous-dossier Post-Video-AddMusic
         subfolder_response = drive_service.files().list(
-            q=f"name='Post-Video-AddMusic' and mimeType='application/vnd.google-apps.folder' and '{client_folder_id}' in parents",
+            q=f"name='Post-Video-AddMusic' and '{client_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
             spaces='drive',
             fields='files(id, name)'
         ).execute()
@@ -65,7 +65,7 @@ def start():
 
         subfolder_id = subfolders[0]['id']
 
-        # Recherche de la vidéo dans ce sous-dossier
+        # Recherche de la vidéo dans le sous-dossier
         video_response = drive_service.files().list(
             q=f"name='{video_name}' and '{subfolder_id}' in parents",
             spaces='drive',
@@ -118,9 +118,20 @@ def start():
 
         print(f"🎵 Musique sélectionnée : {music_name}")
 
-        # Fusion avec FFmpeg
+        # Appliquer le décalage si présent dans le nom (ex: musique@55.mp3)
+        delay = 0
+        if "@" in music_name:
+            try:
+                delay = int(music_name.split("@")[1].split(".")[0])
+                print(f"⏱ Décalage musique détecté : {delay} secondes")
+            except:
+                pass
+
         output_path = f"final_{video_name}"
-        ffmpeg.input(video_path).output(music_path, output_path, shortest=None, vcodec='copy', acodec='aac').run(overwrite_output=True)
+        video_input = ffmpeg.input(video_path)
+        music_input = ffmpeg.input(music_path, ss=delay)
+
+        ffmpeg.output(video_input, music_input, output_path, shortest=None, vcodec='copy', acodec='aac').run(overwrite_output=True)
 
         print(f"✅ Fusion terminée : {output_path}")
 
