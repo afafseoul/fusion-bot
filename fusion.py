@@ -25,7 +25,6 @@ def start():
         print("\n📥 Requête reçue...")
         print(f"✅ Données JSON reçues : {data}")
 
-        # Authentification
         try:
             creds = service_account.Credentials.from_service_account_file(
                 "/etc/secrets/credentials.json", scopes=SCOPES
@@ -33,13 +32,13 @@ def start():
             drive_service = build("drive", "v3", credentials=creds)
             print("✅ Connexion à Google Drive réussie")
         except FileNotFoundError:
-            return jsonify({"error": "❌ Fichier credentials.json introuvable sur Render"}), 500
+            return jsonify({"error": "Fichier credentials.json introuvable sur Render"}), 500
         except ValueError as e:
-            return jsonify({"error": f"❌ Format invalide de credentials.json : {e}"}), 500
+            return jsonify({"error": f"Erreur de format dans credentials.json : {e}"}), 500
         except Exception as e:
             if "invalid_grant" in str(e):
-                return jsonify({"error": "❌ Clé invalide : vérifie la date de création ou si elle est désactivée"}), 401
-            return jsonify({"error": f"❌ Erreur inattendue avec les identifiants : {str(e)}"}), 500
+                return jsonify({"error": "Clé invalide : vérifie la date de création ou si elle est désactivée"}), 401
+            return jsonify({"error": f"Erreur inattendue avec les identifiants : {str(e)}"}), 500
 
         # Recherche du dossier client
         response = drive_service.files().list(
@@ -49,38 +48,54 @@ def start():
         ).execute()
         folders = response.get('files', [])
         if not folders:
-            return jsonify({"error": f"📁 Dossier client '{client}' introuvable"}), 404
+            return jsonify({"error": f"Dossier client '{client}' introuvable"}), 404
 
         client_folder_id = folders[0]['id']
-        print(f"📁 Dossier trouvé : {client_folder_id}")
+        print(f"📁 Dossier du client trouvé : {client_folder_id}")
 
-        # Recherche de la vidéo
+        # Recherche du sous-dossier Post-Video-AddMusic
+        subfolder_response = drive_service.files().list(
+            q=f"name='Post-Video-AddMusic' and mimeType='application/vnd.google-apps.folder' and '{client_folder_id}' in parents",
+            spaces='drive',
+            fields='files(id, name)'
+        ).execute()
+        subfolders = subfolder_response.get('files', [])
+        if not subfolders:
+            return jsonify({"error": "Dossier 'Post-Video-AddMusic' introuvable"}), 404
+
+        subfolder_id = subfolders[0]['id']
+
+        # Recherche de la vidéo dans ce sous-dossier
         video_response = drive_service.files().list(
-            q=f"name='{video_name}' and '{client_folder_id}' in parents",
+            q=f"name='{video_name}' and '{subfolder_id}' in parents",
             spaces='drive',
             fields='files(id, name)'
         ).execute()
         video_files = video_response.get('files', [])
         if not video_files:
-            return jsonify({"error": f"🎥 Vidéo '{video_name}' introuvable"}), 404
+            return jsonify({"error": f"Vidéo '{video_name}' introuvable"}), 404
 
-        video_id = video_files[0]['id']
+        video_file = video_files[0]
+        video_id = video_file['id']
+
+        # Téléchargement de la vidéo
         video_path = f"temp_{video_name}"
         request_video = drive_service.files().get_media(fileId=video_id)
         with open(video_path, "wb") as f:
             downloader = drive_service._http.request(request_video.uri)
             f.write(downloader[1])
+
         print(f"📥 Vidéo téléchargée : {video_path}")
 
-        # Sélection d'une musique
-        music_response = drive_service.files().list(
+        # Choix d'une musique aléatoire
+        music_folder_response = drive_service.files().list(
             q=f"name='Music' and '{client_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
             spaces='drive',
             fields='files(id, name)'
         ).execute()
-        music_folders = music_response.get('files', [])
+        music_folders = music_folder_response.get('files', [])
         if not music_folders:
-            return jsonify({"error": "🎵 Dossier 'Music' introuvable"}), 404
+            return jsonify({"error": "Dossier 'Music' introuvable"}), 404
 
         music_folder_id = music_folders[0]['id']
         music_files_response = drive_service.files().list(
@@ -90,7 +105,7 @@ def start():
         ).execute()
         music_files = music_files_response.get('files', [])
         if not music_files:
-            return jsonify({"error": "🎵 Aucune musique disponible"}), 404
+            return jsonify({"error": "Aucune musique disponible"}), 404
 
         music_file = random.choice(music_files)
         music_name = music_file['name']
@@ -100,28 +115,32 @@ def start():
         with open(music_path, "wb") as f:
             downloader = drive_service._http.request(request_music.uri)
             f.write(downloader[1])
+
         print(f"🎵 Musique sélectionnée : {music_name}")
 
-        # Fusion avec ffmpeg
+        # Fusion avec FFmpeg
         output_path = f"final_{video_name}"
         ffmpeg.input(video_path).output(music_path, output_path, shortest=None, vcodec='copy', acodec='aac').run(overwrite_output=True)
+
         print(f"✅ Fusion terminée : {output_path}")
 
         # Upload dans ReadyToPost
-        ready_response = drive_service.files().list(
+        ready_folder_response = drive_service.files().list(
             q=f"name='ReadyToPost' and '{client_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
             spaces='drive',
             fields='files(id, name)'
         ).execute()
-        ready_folders = ready_response.get('files', [])
+        ready_folders = ready_folder_response.get('files', [])
         if not ready_folders:
-            return jsonify({"error": "📂 Dossier 'ReadyToPost' introuvable"}), 404
+            return jsonify({"error": "Dossier 'ReadyToPost' introuvable"}), 404
 
         ready_folder_id = ready_folders[0]['id']
+
         file_metadata = {"name": output_path, "parents": [ready_folder_id]}
         media = MediaFileUpload(output_path, mimetype='video/mp4')
         drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        print(f"🚀 Vidéo uploadée dans ReadyToPost : {output_path}")
+
+        print(f"🚀 Vidéo finale uploadée : {output_path}")
 
         # Nettoyage
         os.remove(video_path)
