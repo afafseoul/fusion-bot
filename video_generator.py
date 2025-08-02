@@ -1,7 +1,8 @@
 import os
 import requests
 from moviepy.editor import *
-from utils.subtitles import generate_subtitle_clips
+from utils.text_overlay import generate_text_overlay
+
 
 def download_file_from_drive(audio_filename, drive_folder_id, save_path):
     # Format Google Drive URL (publique + fichier directement téléchargeable)
