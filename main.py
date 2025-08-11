@@ -1,54 +1,51 @@
-
 from flask import Flask, request, jsonify
 import os
-import shutil
+import tempfile
 import uuid
-from video_generator import generate_video
+from video_generator import generate_video_from_plan
 
 app = Flask(__name__)
 
-@app.route("/")
-def index():
-    return "🟢 Render Flask backend ready."
+@app.get("/")
+def health():
+    return "🟢 fusion-bot ready"
 
-@app.route("/create-video", methods=["POST"])
+@app.post("/create-video")
 def create_video():
     try:
-        data = request.get_json()
+        data = request.get_json(force=True, silent=False)
+        if not data or "plan" not in data:
+            return jsonify({"error": "Missing 'plan' array in JSON"}), 400
 
-        # Vérification des champs requis
-        required_keys = ["audio_filename", "drive_folder_id", "subtitles", "output_name"]
-        for key in required_keys:
-            if key not in data:
-                return jsonify({"error": f"Missing key: {key}"}), 400
+        # Output options (defaults for Reels/Shorts)
+        width = int(data.get("width", 1080))
+        height = int(data.get("height", 1920))
+        fps = int(data.get("fps", 30))
+        audio_url = data.get("audio_url")  # direct URL to mp3/wav/ogg
 
-        # Création d'un dossier temporaire unique
-        session_id = str(uuid.uuid4())
-        temp_dir = os.path.join("temp", session_id)
-        os.makedirs(temp_dir, exist_ok=True)
+        # Unique working directory per request
+        workdir = os.path.join(tempfile.gettempdir(), f"fusionbot_{uuid.uuid4().hex}")
+        os.makedirs(workdir, exist_ok=True)
 
-        print(f"[INFO] 🎬 Nouvelle requête reçue — session {session_id}")
-        print(f"[INFO] 🔗 Audio : {data['audio_filename']} depuis dossier {data['drive_folder_id']}")
-        print(f"[INFO] 🎞️ Nombre de GIFs : {len(data['subtitles'])}")
-        print(f"[INFO] 💾 Nom de sortie : {data['output_name']}")
+        output_path = os.path.join(workdir, data.get("output_name", "output.mp4"))
 
-        # Appel de la fonction de génération (à définir dans video_generator.py)
-        output_path = generate_video(
-            audio_filename=data["audio_filename"],
-            drive_folder_id=data["drive_folder_id"],
-            subtitles=data["subtitles"],
-            output_name=data["output_name"],
-            temp_dir=temp_dir
+        result_path = generate_video_from_plan(
+            plan=data["plan"],
+            output_path=output_path,
+            size=(width, height),
+            fps=fps,
+            audio_url=audio_url,
+            workdir=workdir
         )
 
-        return jsonify({
-            "status": "success",
-            "output_path": output_path
-        }), 200
+        return jsonify({"status": "success", "path": result_path}), 200
 
     except Exception as e:
-        print(f"[ERROR] 💥 Erreur lors du traitement : {str(e)}")
+        # Log full error to Render logs
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # For local testing only. On Render, use gunicorn via Procfile.
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=True)
