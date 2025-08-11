@@ -1,8 +1,52 @@
 from flask import Flask, request, jsonify
 import os, tempfile, uuid, base64, traceback
+
 from video_generator import generate_video_from_plan
 
+# === Google Drive ===
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaFileUpload
+from google.oauth2 import service_account
+
+SERVICE_ACCOUNT_PATH = "/etc/secrets/credentials.json"   # Secret Render
+DEFAULT_DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")   # Optionnel (fallback)
+MAKE_PUBLIC = os.getenv("DRIVE_MAKE_PUBLIC", "true").lower() == "true"
+
 app = Flask(__name__)
+
+def _drive_service():
+    creds = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_PATH,
+        scopes=["https://www.googleapis.com/auth/drive.file"]
+    )
+    return build("drive", "v3", credentials=creds)
+
+def upload_to_drive(file_path: str, folder_id: str, make_public: bool = True):
+    service = _drive_service()
+    meta = {"name": os.path.basename(file_path)}
+    if folder_id:
+        meta["parents"] = [folder_id]
+    media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
+
+    created = service.files().create(body=meta, media_body=media, fields="id,name").execute()
+    file_id = created.get("id")
+
+    web_view, web_content = None, None
+    if make_public:
+        try:
+            service.permissions().create(
+                fileId=file_id,
+                body={"role": "reader", "type": "anyone"},
+                fields="id"
+            ).execute()
+            got = service.files().get(fileId=file_id, fields="webViewLink,webContentLink").execute()
+            web_view = got.get("webViewLink")
+            web_content = got.get("webContentLink")
+        except HttpError:
+            pass
+
+    return {"file_id": file_id, "webViewLink": web_view, "webContentLink": web_content}
 
 @app.get("/")
 def health():
@@ -19,7 +63,6 @@ def create_video():
         height = int(data.get("height", 1920))
         fps    = int(data.get("fps", 30))
 
-        # audio : soit base64 direct, soit URL (optionnel)
         audio_base64 = data.get("audio_base64")
         audio_url    = data.get("audio_url")
 
@@ -34,6 +77,7 @@ def create_video():
 
         output_path = os.path.join(workdir, data.get("output_name", "output.mp4"))
 
+        # 1) Montage
         result_path = generate_video_from_plan(
             plan=data["plan"],
             output_path=output_path,
@@ -44,7 +88,17 @@ def create_video():
             workdir=workdir
         )
 
-        return jsonify({"status": "success", "path": result_path}), 200
+        # 2) Upload Drive
+        drive_folder_id = data.get("drive_folder_id") or DEFAULT_DRIVE_FOLDER_ID
+        drive_info = None
+        if drive_folder_id:
+            drive_info = upload_to_drive(result_path, drive_folder_id, make_public=MAKE_PUBLIC)
+
+        return jsonify({
+            "status": "success",
+            "local_path": result_path,
+            "drive": drive_info
+        }), 200
 
     except Exception as e:
         traceback.print_exc()
