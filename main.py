@@ -1,7 +1,5 @@
 from flask import Flask, request, jsonify
-import os
-import tempfile
-import uuid
+import os, tempfile, uuid, base64, traceback
 from video_generator import generate_video_from_plan
 
 app = Flask(__name__)
@@ -17,15 +15,22 @@ def create_video():
         if not data or "plan" not in data:
             return jsonify({"error": "Missing 'plan' array in JSON"}), 400
 
-        # Output options (defaults for Reels/Shorts)
-        width = int(data.get("width", 1080))
+        width  = int(data.get("width", 1080))
         height = int(data.get("height", 1920))
-        fps = int(data.get("fps", 30))
-        audio_url = data.get("audio_url")  # direct URL to mp3/wav/ogg
+        fps    = int(data.get("fps", 30))
 
-        # Unique working directory per request
+        # audio : soit base64 direct, soit URL (optionnel)
+        audio_base64 = data.get("audio_base64")
+        audio_url    = data.get("audio_url")
+
         workdir = os.path.join(tempfile.gettempdir(), f"fusionbot_{uuid.uuid4().hex}")
         os.makedirs(workdir, exist_ok=True)
+
+        audio_path = None
+        if audio_base64:
+            audio_path = os.path.join(workdir, "audio.mp3")
+            with open(audio_path, "wb") as f:
+                f.write(base64.b64decode(audio_base64))
 
         output_path = os.path.join(workdir, data.get("output_name", "output.mp4"))
 
@@ -34,18 +39,16 @@ def create_video():
             output_path=output_path,
             size=(width, height),
             fps=fps,
-            audio_url=audio_url,
+            audio_url=(None if audio_path else audio_url),
+            audio_path=audio_path,
             workdir=workdir
         )
 
         return jsonify({"status": "success", "path": result_path}), 200
 
     except Exception as e:
-        # Log full error to Render logs
-        import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    # For local testing only. On Render, use gunicorn via Procfile.
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=True)
