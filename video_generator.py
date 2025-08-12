@@ -1,14 +1,11 @@
-import os, re, ffmpeg, requests, shutil
-from typing import List, Dict, Tuple, Optional
+import os, re, requests, tempfile
+from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, TextClip, concatenate_videoclips, vfx
+from text_overlay import generate_text_overlay
 
-# ---------- helpers ----------
-
-def _normalize_gif_url(url: str) -> str:
+def _normalize_giphy(url: str) -> str:
     """
-    Si on reçoit une page GIPHY du type:
-      https://giphy.com/gifs/<slug>-<id>
-    on la convertit en asset MP4:
-      https://media.giphy.com/media/<id>/giphy.mp4
+    Transforme une page GIPHY en asset vidéo direct si besoin.
+    https://giphy.com/gifs/<slug>-<id> -> https://media.giphy.com/media/<id>/giphy.mp4
     """
     try:
         if "giphy.com/gifs" in url and "/media/" not in url:
@@ -20,127 +17,89 @@ def _normalize_gif_url(url: str) -> str:
     except Exception:
         return url
 
-def _download(url: str, dest_path: str):
+def _download(url: str, dest: str):
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
-        with open(dest_path, "wb") as f:
+        with open(dest, "wb") as f:
             for chunk in r.iter_content(8192):
                 if chunk:
                     f.write(chunk)
-    return dest_path
+    return dest
 
-def _ensure_media(url: str, workdir: str, index: int) -> str:
-    url = _normalize_gif_url(url)
-    ext = ".mp4" if url.lower().endswith(".mp4") else (
-        ".gif" if url.lower().endswith(".gif") else ".bin"
-    )
-    path = os.path.join(workdir, f"src_{index}{ext}")
-    return _download(url, path)
+def _hhmmssms(seconds: float):
+    ms = int(round((seconds - int(seconds)) * 1000))
+    s  = int(seconds) % 60
+    m  = (int(seconds) // 60) % 60
+    h  = int(seconds) // 3600
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-def _s(val) -> float:
-    try:
-        return float(val)
-    except Exception:
-        raise ValueError(f"start_time/duration must be numeric seconds. Got: {val}")
-
-def _gen_srt(plan: List[Dict], srt_path: str) -> Optional[str]:
-    """
-    Pour chaque item du plan, si 'text' (ou 'subtitle_text'/'caption') ET 'subtitles' (array de
-    fenêtres "HH:MM:SS,mmm --> HH:MM:SS,mmm") sont présents, on génère un .srt.
-    """
-    lines, idx = [], 1
-    for item in plan:
-        text = item.get("text") or item.get("subtitle_text") or item.get("caption")
-        times = item.get("subtitles") or []
-        if not text or not times:
-            continue
-        for t in times:
-            t = str(t).strip()
-            if "-->" not in t:
-                continue
-            start, end = [p.strip() for p in t.split("-->")]
-            lines.append(str(idx))
-            lines.append(f"{start} --> {end}")
-            for ln in str(text).splitlines():
-                lines.append(ln)
-            lines.append("")
-            idx += 1
-    if not lines:
-        return None
-    with open(srt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    return srt_path
-
-# ---------- core ----------
-
-def generate_video_from_plan(
-    plan: List[Dict],
-    output_path: str,
-    size: Tuple[int, int] = (1080, 1920),
+def generate_video(
+    plan,
+    audio_path: str,
+    output_name: str,
+    temp_dir: str,
+    width: int = 1080,
+    height: int = 1920,
     fps: int = 30,
-    audio_url: Optional[str] = None,
-    audio_path: Optional[str] = None,
-    workdir: Optional[str] = None,
-) -> str:
-    width, height = size
-    os.makedirs(workdir or os.path.dirname(output_path) or ".", exist_ok=True)
-    workdir = workdir or os.path.dirname(output_path) or "."
+):
+    """
+    plan: liste d'objets:
+      { gif_url, start_time?, duration, text?, subtitles?[] }
+    """
+    os.makedirs(temp_dir, exist_ok=True)
+    clips = []
 
-    # 1) préparer les segments (tri par start_time)
-    segments = []
-    for i, item in enumerate(sorted(plan, key=lambda x: x.get("start_time", 0))):
-        src = _ensure_media(item["gif_url"], workdir, i)
-        seg = os.path.join(workdir, f"seg_{i:03d}.mp4")
-        duration = _s(item.get("duration", 0))
+    timeline = 0.0
+    for idx, item in enumerate(plan):
+        url = _normalize_giphy(item.get("gif_url", ""))
+        if not url:
+            continue
 
-        # mise à l’échelle, padding 1080x1920, fps, et coupe à duration
-        v = ffmpeg.input(src)  # .gif ou .mp4
-        v = (v.filter("scale", width, -2)
-               .filter("pad", width, height, "(ow-iw)/2", "(oh-ih)/2")
-               .filter("fps", fps))
-        out = ffmpeg.output(v, seg, vcodec="libx264", pix_fmt="yuv420p", r=fps, t=duration, loglevel="error")
-        ffmpeg.run(out, overwrite_output=True)
-        segments.append(seg)
+        src_ext = ".mp4" if url.lower().endswith(".mp4") else ".gif"
+        src_path = os.path.join(temp_dir, f"src_{idx}{src_ext}")
+        _download(url, src_path)
 
-    # 2) concat
-    concat_txt = os.path.join(workdir, "concat.txt")
-    with open(concat_txt, "w", encoding="utf-8") as f:
-        for p in segments:
-            f.write(f"file '{p}'\n")
+        dur = float(item.get("duration", 0)) or 0.0
+        if dur <= 0:
+            continue
 
-    concatenated = os.path.join(workdir, "concat.mp4")
-    concat_stream = ffmpeg.input(concat_txt, f="concat", safe=0)
-    out = ffmpeg.output(concat_stream, concatenated, vcodec="libx264", pix_fmt="yuv420p", r=fps, loglevel="error")
-    ffmpeg.run(out, overwrite_output=True)
+        # clip vidéo
+        clip = VideoFileClip(src_path).without_audio()
+        # resize + letterbox vertical
+        clip = clip.fx(vfx.resize, width=width)
+        if clip.h < height:
+            clip = clip.on_color(size=(width, height), color=(0,0,0), pos=("center","center"))
+        elif clip.h > height:
+            clip = clip.fx(vfx.resize, height=height).on_color(size=(width, height), color=(0,0,0), pos=("center","center"))
 
-    # 3) audio (local > url)
-    if not audio_path and audio_url:
-        audio_path = os.path.join(workdir, "audio" + (os.path.splitext(audio_url)[1] or ".mp3"))
-        _download(audio_url, audio_path)
+        clip = clip.set_duration(dur)
 
-    with_audio = os.path.join(workdir, "video_audio.mp4")
-    if audio_path:
-        v = ffmpeg.input(concatenated)
-        a = ffmpeg.input(audio_path)
-        out = ffmpeg.output(v, a, with_audio, vcodec="libx264", acodec="aac", audio_bitrate="192k",
-                            shortest=1, r=fps, loglevel="error")
-        ffmpeg.run(out, overwrite_output=True)
-    else:
-        with_audio = concatenated
+        # overlay texte (facultatif)
+        txt = (item.get("text") or "").strip()
+        if txt:
+            try:
+                sub = generate_text_overlay(txt, dur, (width, height))
+                clip = CompositeVideoClip([clip, sub]).set_duration(dur)
+            except Exception:
+                # si ImageMagick n'est pas dispo, on sort quand même sans overlay
+                pass
 
-    # 4) sous-titres (si fournis)
-    srt_file = _gen_srt(plan, os.path.join(workdir, "subs.srt"))
-    if srt_file:
-        style = (
-            "FontName=Noto Sans,Fontsize=52,"
-            "PrimaryColour=&H00FFFFFF&,OutlineColour=&H00101010&,"
-            "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=70"
-        )
-        v = ffmpeg.input(with_audio).filter("subtitles", srt_file, force_style=style)
-        out = ffmpeg.output(v, output_path, vcodec="libx264", pix_fmt="yuv420p", r=fps, loglevel="error")
-        ffmpeg.run(out, overwrite_output=True)
-    else:
-        if with_audio != output_path:
-            shutil.move(with_audio, output_path)
+        clips.append(clip)
 
-    return output_path
+        # injecte les sous-titres si absents
+        if not item.get("subtitles"):
+            start = float(item.get("start_time", timeline))
+            end = start + dur
+            item["subtitles"] = [f"{_hhmmssms(start)} --> {_hhmmssms(end)}"]
+        timeline += dur
+
+    if not clips:
+        raise ValueError("Plan vide ou durées nulles.")
+
+    video = concatenate_videoclips(clips, method="compose")
+    audio = AudioFileClip(audio_path)
+    final = video.set_audio(audio)
+    out_path = os.path.join(temp_dir, output_name)
+    final.write_videofile(out_path, codec="libx264", audio_codec="aac", fps=fps)
+
+    return out_path
