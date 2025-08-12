@@ -1,6 +1,7 @@
 import os, re, requests, tempfile
 from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, TextClip, concatenate_videoclips, vfx
-from text_overlay import generate_text_overlay
+from utils.text_overlay import generate_text_overlay
+
 
 def _normalize_giphy(url: str) -> str:
     """
