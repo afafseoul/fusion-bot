@@ -3,9 +3,12 @@ gunicorn
 
 requests
 ffmpeg-python
+
+# Versions compatibles MoviePy 1.0.x
 moviepy==1.0.3
+imageio==2.31.1
 imageio-ffmpeg==0.4.9
-Pillow
+Pillow==9.5.0
 numpy
 
 google-api-python-client
