@@ -1,5 +1,5 @@
 import os, re, requests, tempfile
-from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, TextClip, concatenate_videoclips, vfx
+from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, concatenate_videoclips, vfx
 from utils.text_overlay import generate_text_overlay
 
 
