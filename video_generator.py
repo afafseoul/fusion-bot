@@ -1,192 +1,109 @@
-# video_generator.py
-import os
-import re
-import requests
-from typing import Any, Dict, List
-from urllib.parse import urlparse
+import os, re, tempfile
+from typing import List, Dict, Any, Optional
+from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, concatenate_videoclips, vfx
+from text_overlay import make_text_clip
 
-from moviepy.editor import (
-    VideoFileClip,
-    AudioFileClip,
-    CompositeVideoClip,
-    concatenate_videoclips,
-    vfx,
-)
-from utils.text_overlay import generate_text_overlay
+CONCAT_METHOD = os.getenv("CONCAT_METHOD", "chain")   # 'chain' (low-mem) | 'compose'
+FFMPEG_THREADS = int(os.getenv("FFMPEG_THREADS", "1"))
+X264_PRESET = os.getenv("X264_PRESET", "ultrafast")
+VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "2500k")
 
+def _seconds(x) -> float:
+    try: return float(x)
+    except: return 0.0
 
-# ---------- Utils ----------
+def normalize_giphy_url(u: str) -> str:
+    if not u: return u
+    if u.endswith(".mp4") and "giphy" in u: return u
+    m = re.search(r"giphy\.com/(?:embed|media)/([A-Za-z0-9]+)", u)
+    if m: return f"https://media.giphy.com/media/{m.group(1)}/giphy.mp4"
+    m = re.search(r"giphy\.com/gifs/[^/]*-([A-Za-z0-9]+)", u)
+    if m: return f"https://media.giphy.com/media/{m.group(1)}/giphy.mp4"
+    m = re.search(r"/media/([A-Za-z0-9]+)/giphy\.mp4", u)
+    if m: return f"https://media.giphy.com/media/{m.group(1)}/giphy.mp4"
+    return u
 
-def _normalize_giphy(url: str) -> str:
-    """
-    Convertit des URLs GIPHY de page en lien média direct.
-    Gère les formes courantes :
-      - https://giphy.com/gifs/<slug>-<id>
-      - https://giphy.com/embed/<id>
-      - https://giphy.com/<...>/<id>
-      - Laisse passer les liens media[0-4].giphy.com/.../giphy.mp4 ou .gif
-    """
-    try:
-        if not url:
-            return url
+def fit_cover(clip: VideoFileClip, W: int, H: int) -> VideoFileClip:
+    if clip.w == 0 or clip.h == 0:
+        return clip
+    scale = max(W/clip.w, H/clip.h)
+    r = clip.resize(scale)
+    x1 = max(0, (r.w - W)/2)
+    y1 = max(0, (r.h - H)/2)
+    return r.crop(x1=x1, y1=y1, x2=x1+W, y2=y1+H)
 
-        u = urlparse(url)
-        host = (u.netloc or "").lower()
-        path = u.path or ""
+def _build_segment(seg: Dict[str, Any], W:int, H:int, FPS:int, logger=None, req_id:str="?"):
+    url_raw = (seg.get("gif_url") or "").strip()
+    url = normalize_giphy_url(url_raw)
+    dur = max(0.0, _seconds(seg.get("duration")))
+    txt = (seg.get("text") or "").strip()
+    subs = seg.get("subtitles") or []
 
-        # Déjà un lien media direct (mp4/gif) -> ne rien faire
-        if "giphy.com" in host and "/media/" in path and path.endswith((".mp4", ".gif")):
-            return url
+    if logger: logger.info(f"[{req_id}] seg url_raw={url_raw} url_norm={url} dur={dur} text={'yes' if txt else 'no'} subs={len(subs)}")
 
-        # /embed/<id>  -> media/<id>/giphy.mp4
-        m = re.search(r"/embed/([A-Za-z0-9]+)", path)
-        if m:
-            gid = m.group(1)
-            return f"https://media.giphy.com/media/{gid}/giphy.mp4"
+    base = VideoFileClip(url, audio=False)
+    seg_clip = vfx.loop(base, duration=dur) if dur > 0 else base
+    seg_clip = fit_cover(seg_clip, W, H).set_fps(FPS)
 
-        # /gifs/<slug>-<id>  -> media/<id>/giphy.mp4
-        m = re.search(r"/gifs/.+-([A-Za-z0-9]+)$", path.rstrip("/"))
-        if m:
-            gid = m.group(1)
-            return f"https://media.giphy.com/media/{gid}/giphy.mp4"
+    overlays = []
+    if txt:
+        t = make_text_clip(txt, W=W, start=0.0, duration=seg_clip.duration, position="top", fontsize=64, y_margin=80)
+        if t: overlays.append(t)
 
-        # fallback : dernier segment alphanumérique comme id
-        m = re.search(r"([A-Za-z0-9]+)$", path.rstrip("/"))
-        if "giphy.com" in host and m:
-            gid = m.group(1)
-            return f"https://media.giphy.com/media/{gid}/giphy.mp4"
+    for sub in subs:
+        s = max(0.0, _seconds(sub.get("start")))
+        e = max(s, _seconds(sub.get("end")))
+        txt_sub = (sub.get("text") or "").strip()
+        if not txt_sub or e <= s: continue
+        sc = make_text_clip(txt_sub, W=W, start=s, duration=(e-s), position="bottom", fontsize=56, y_margin=64)
+        if sc: overlays.append(sc)
 
-        return url
-    except Exception:
-        return url
+    if overlays:
+        comp = CompositeVideoClip([seg_clip, *overlays], size=(W, H))
+        comp = comp.set_duration(seg_clip.duration).set_fps(FPS)
+    else:
+        comp = seg_clip
+    return comp
 
+def generate_video(plan: List[Dict[str, Any]], audio_path: str, output_name: str,
+                   temp_dir: Optional[str], width:int, height:int, fps:int,
+                   logger=None, req_id:str="?") -> str:
+    W,H,FPS = width, height, fps
+    seg_clips = []
+    for i, seg in enumerate(plan):
+        if logger: logger.info(f"[{req_id}] build seg#{i}")
+        seg_clips.append(_build_segment(seg, W,H,FPS, logger, req_id))
 
-def _download(url: str, dest: str) -> str:
-    """
-    Télécharge un fichier avec un User-Agent (certains CDNs répondent 403 sinon).
-    """
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; FusionBot/1.0)"}
-    with requests.get(url, stream=True, timeout=60, headers=headers) as r:
-        r.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(8192):
-                if chunk:
-                    f.write(chunk)
-    return dest
+    if not seg_clips: raise ValueError("no segments")
 
+    video = concatenate_videoclips(seg_clips, method=CONCAT_METHOD).set_fps(FPS)
 
-def _hhmmssms(seconds: float) -> str:
-    ms = int(round((seconds - int(seconds)) * 1000))
-    s = int(seconds) % 60
-    m = (int(seconds) // 60) % 60
-    h = int(seconds) // 3600
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-# ---------- Core ----------
-
-def generate_video(
-    plan: List[Dict[str, Any]],
-    audio_path: str,
-    output_name: str,
-    temp_dir: str,
-    width: int = 1080,
-    height: int = 1920,
-    fps: int = 30,
-) -> str:
-    """
-    plan: liste d'objets de la forme:
-      {
-        "gif_url" | "url" | "mp4" | "mp4_url": <string>,
-        "duration": <float>,
-        "text": <string, optionnel>,
-        "start_time": <float, optionnel>,
-        "subtitles": [<string>, ...] optionnel
-      }
-    """
-    os.makedirs(temp_dir, exist_ok=True)
-    clips: List[VideoFileClip] = []
-
-    timeline = 0.0
-
-    for idx, item in enumerate(plan or []):
-        if not isinstance(item, dict):
-            # tolérance : si l'item n'est pas un dict, on passe
-            continue
-
-        # 1) Récupère l’URL prioritaire (MP4 si disponible)
-        url = (
-            item.get("mp4")
-            or item.get("mp4_url")
-            or item.get("gif_url")
-            or item.get("url")
-            or ""
-        )
-        url = _normalize_giphy(url)
-        if not url:
-            continue
-
-        # 2) Télécharge la source
-        #    (si pas .mp4 on garde l’extension .gif, MoviePy sait lire les GIF)
-        ext = ".mp4" if url.lower().endswith((".mp4", ".mov", ".webm")) else ".gif"
-        src_path = os.path.join(temp_dir, f"src_{idx}{ext}")
-        try:
-            _download(url, src_path)
-        except Exception:
-            # on skip si le média ne se télécharge pas
-            continue
-
-        # 3) Durée
-        dur = float(item.get("duration", 0) or 0)
-        if dur <= 0:
-            continue
-
-        # 4) Clip vidéo (sans audio)
-        clip = VideoFileClip(src_path).without_audio()
-
-        # 5) Resize/letterbox en vertical 1080x1920
-        #    On fixe d'abord la largeur, puis on ajoute des bandes si besoin
-        clip = clip.fx(vfx.resize, width=width)
-        if clip.h < height:
-            clip = clip.on_color(size=(width, height), color=(0, 0, 0), pos=("center", "center"))
-        elif clip.h > height:
-            # si après resize largeur la hauteur dépasse, on ajuste la hauteur
-            clip = clip.fx(vfx.resize, height=height).on_color(
-                size=(width, height), color=(0, 0, 0), pos=("center", "center")
-            )
-
-        clip = clip.set_duration(dur)
-
-        # 6) Overlay texte (facultatif)
-        txt = (item.get("text") or "").strip()
-        if txt:
-            try:
-                overlay = generate_text_overlay(txt, dur, (width, height))
-                clip = CompositeVideoClip([clip, overlay]).set_duration(dur)
-            except Exception:
-                # si ImageMagick/Pillow pose souci, on continue sans overlay
-                pass
-
-        clips.append(clip)
-
-        # 7) Sous-titres auto si absents (SRT-like en mémoire)
-        if not item.get("subtitles"):
-            start = float(item.get("start_time", timeline) or timeline)
-            end = start + dur
-            item["subtitles"] = [f"{_hhmmssms(start)} --> {_hhmmssms(end)}"]
-
-        timeline += dur
-
-    if not clips:
-        raise ValueError("Plan vide ou médias invalides.")
-
-    # 8) Concaténation & audio final
-    video = concatenate_videoclips(clips, method="compose")
     audio = AudioFileClip(audio_path)
-    final = video.set_audio(audio)
+    final_duration = min(video.duration, audio.duration)
+    video = video.set_duration(final_duration).set_audio(audio.subclip(0, final_duration))
 
-    out_path = os.path.join(temp_dir, output_name)
-    # Conseil: paramètre "threads" peut accélérer selon l’instance Render
-    final.write_videofile(out_path, codec="libx264", audio_codec="aac", fps=fps)
+    out_path = os.path.join(temp_dir or tempfile.mkdtemp(prefix="fusionbot_"), output_name)
 
+    video.write_videofile(
+        out_path,
+        fps=FPS,
+        codec="libx264",
+        audio_codec="aac",
+        preset=X264_PRESET,
+        bitrate=VIDEO_BITRATE,
+        threads=FFMPEG_THREADS,
+        verbose=False,
+        logger=None,
+        temp_audiofile=os.path.join(temp_dir or ".", "temp-audio.m4a"),
+        remove_temp=True,
+    )
+
+    try:
+        audio.close()
+        for c in seg_clips:
+            c.close()
+    except Exception:
+        pass
+
+    if logger: logger.info(f"[{req_id}] done -> {out_path}")
     return out_path
