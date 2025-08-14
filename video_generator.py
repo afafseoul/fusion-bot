@@ -174,7 +174,7 @@ def make_text_clip(
     clip = ImageClip(arr).set_start(start)
     if duration is not None: clip = clip.set_duration(duration)
     if position == "top":
-        clip = clip.set_position(("center", lambda t: y_margin))
+        clip = clip.set_position(("center", y_margin))   # y fixe en pixels
     else:
         clip = clip.set_position(("center", "bottom")).margin(bottom=y_margin, opacity=0)
     clip = clip.fadein(0.15).fadeout(0.15)
