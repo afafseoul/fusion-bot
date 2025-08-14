@@ -1,6 +1,8 @@
-# video_generator.py — autonome (pas d'import text_overlay)
-import os, re, tempfile
+# video_generator.py — télécharge d'abord les médias GIPHY en local (robuste)
+import os, re, tempfile, time
 from typing import List, Dict, Any, Optional
+import requests
+
 from moviepy.editor import (
     VideoFileClip, AudioFileClip, ImageClip,
     CompositeVideoClip, concatenate_videoclips, vfx
@@ -8,11 +10,13 @@ from moviepy.editor import (
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 
-# Réglages low-RAM via ENV
+# Réglages low-RAM via ENV (déjà posés côté Render)
 CONCAT_METHOD = os.getenv("CONCAT_METHOD", "chain")   # 'chain' (léger) | 'compose'
 FFMPEG_THREADS = int(os.getenv("FFMPEG_THREADS", "1"))
 X264_PRESET = os.getenv("X264_PRESET", "ultrafast")
 VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "2500k")
+
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
 
 def _seconds(x) -> float:
     try: return float(x)
@@ -28,6 +32,50 @@ def normalize_giphy_url(u: str) -> str:
     m = re.search(r"/media/([A-Za-z0-9]+)/giphy\.mp4", u)
     if m: return f"https://media.giphy.com/media/{m.group(1)}/giphy.mp4"
     return u
+
+def _ext_from_ct(ct: str) -> str:
+    if not ct: return ".bin"
+    if "mp4" in ct: return ".mp4"
+    if "gif" in ct: return ".gif"
+    if "webm" in ct: return ".webm"
+    return ".bin"
+
+def fetch_media(url: str, tmpdir: str, logger=None, req_id: str = "?") -> str:
+    """
+    Télécharge l'URL (avec UA/Referer + retries) vers un fichier local.
+    Renvoie le chemin du fichier local.
+    """
+    headers = {
+        "User-Agent": UA,
+        "Referer": "https://giphy.com/",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+    }
+    tries = 3
+    last_err = None
+    for k in range(tries):
+        try:
+            with requests.get(url, headers=headers, stream=True, timeout=(5, 30), allow_redirects=True) as r:
+                sc = r.status_code
+                if sc != 200:
+                    raise RuntimeError(f"HTTP {sc}")
+                ct = r.headers.get("Content-Type", "")
+                ext = _ext_from_ct(ct)
+                # force .mp4 si l'URL finit par .mp4
+                if url.lower().endswith(".mp4"): ext = ".mp4"
+                fname = f"seg_{int(time.time()*1000)}_{k}{ext}"
+                fpath = os.path.join(tmpdir, fname)
+                with open(fpath, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1_048_576):
+                        if chunk:
+                            f.write(chunk)
+                if logger: logger.info(f"[{req_id}] download ok -> {fpath} ct={ct}")
+                return fpath
+        except Exception as e:
+            last_err = e
+            if logger: logger.info(f"[{req_id}] download retry {k+1}/{tries} err={e}")
+            time.sleep(0.5 * (k+1))
+    raise RuntimeError(f"download failed: {last_err}")
 
 def fit_cover(clip: VideoFileClip, W: int, H: int) -> VideoFileClip:
     if clip.w == 0 or clip.h == 0: return clip
@@ -132,7 +180,7 @@ def make_text_clip(
     return clip
 # ------------------------------------------
 
-def _build_segment(seg: Dict[str, Any], W:int, H:int, FPS:int, logger=None, req_id:str="?"):
+def _build_segment(seg: Dict[str, Any], W:int, H:int, FPS:int, tmpdir:str, logger=None, req_id:str="?"):
     url_raw = (seg.get("gif_url") or "").strip()
     url = normalize_giphy_url(url_raw)
     dur = max(0.0, _seconds(seg.get("duration")))
@@ -140,7 +188,10 @@ def _build_segment(seg: Dict[str, Any], W:int, H:int, FPS:int, logger=None, req_
     subs = seg.get("subtitles") or []
     if logger: logger.info(f"[{req_id}] seg url_raw={url_raw} url_norm={url} dur={dur} text={'yes' if txt else 'no'} subs={len(subs)}")
 
-    base = VideoFileClip(url, audio=False)
+    # 🔽 Nouveau : on télécharge le média avant ouverture MoviePy
+    local_path = fetch_media(url, tmpdir, logger, req_id)
+
+    base = VideoFileClip(local_path, audio=False)
     seg_clip = vfx.loop(base, duration=dur) if dur > 0 else base
     seg_clip = fit_cover(seg_clip, W, H).set_fps(FPS)
 
@@ -148,8 +199,13 @@ def _build_segment(seg: Dict[str, Any], W:int, H:int, FPS:int, logger=None, req_
     if txt:
         t = make_text_clip(txt, W=W, start=0.0, duration=seg_clip.duration, position="top", fontsize=64, y_margin=80)
         if t: overlays.append(t)
+
+    # Robustesse: n'utiliser que les dicts {"start","end","text"}
     for sub in subs:
-        s = max(0.0, _seconds(sub.get("start"))); e = max(s, _seconds(sub.get("end")))
+        if not isinstance(sub, dict):  # ignore strings/SRT bruts
+            continue
+        s = max(0.0, _seconds(sub.get("start")))
+        e = max(s, _seconds(sub.get("end")))
         txt_sub = (sub.get("text") or "").strip()
         if not txt_sub or e <= s: continue
         sc = make_text_clip(txt_sub, W=W, start=s, duration=(e-s), position="bottom", fontsize=56, y_margin=64)
@@ -166,7 +222,13 @@ def generate_video(plan: List[Dict[str, Any]], audio_path: str, output_name: str
                    temp_dir: Optional[str], width:int, height:int, fps:int,
                    logger=None, req_id:str="?") -> str:
     W,H,FPS = width, height, fps
-    seg_clips = [_build_segment(seg, W,H,FPS, logger, req_id) for seg in plan]
+    tmpdir = temp_dir or tempfile.mkdtemp(prefix="fusionbot_")
+
+    seg_clips = []
+    for i, seg in enumerate(plan):
+        if logger: logger.info(f"[{req_id}] build seg#{i}")
+        seg_clips.append(_build_segment(seg, W,H,FPS, tmpdir, logger, req_id))
+
     if not seg_clips: raise ValueError("no segments")
 
     video = concatenate_videoclips(seg_clips, method=CONCAT_METHOD).set_fps(FPS)
@@ -175,8 +237,7 @@ def generate_video(plan: List[Dict[str, Any]], audio_path: str, output_name: str
     final_duration = min(video.duration, audio.duration)
     video = video.set_duration(final_duration).set_audio(audio.subclip(0, final_duration))
 
-    out_dir = temp_dir or tempfile.mkdtemp(prefix="fusionbot_")
-    out_path = os.path.join(out_dir, output_name)
+    out_path = os.path.join(tmpdir, output_name)
 
     video.write_videofile(
         out_path,
@@ -188,7 +249,7 @@ def generate_video(plan: List[Dict[str, Any]], audio_path: str, output_name: str
         threads=FFMPEG_THREADS,
         verbose=False,
         logger=None,
-        temp_audiofile=os.path.join(out_dir, "temp-audio.m4a"),
+        temp_audiofile=os.path.join(tmpdir, "temp-audio.m4a"),
         remove_temp=True,
     )
 
