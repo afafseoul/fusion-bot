@@ -1,9 +1,15 @@
 import os, json, time, tempfile, logging, shutil
 from uuid import uuid4
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from flask import Flask, request, jsonify, g
 
 from video_generator import generate_video
+
+# --- Google Drive (clé en Secret Files) ---
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+# -----------------------------------------
 
 app = Flask(__name__)
 logging.basicConfig(
@@ -11,6 +17,32 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 app.logger.setLevel(logging.getLogger().level)
+
+
+# --------- Utils Drive ----------
+def _gdrive_service():
+    # Chemin du secret file (Render > Environment > Secret Files)
+    path = os.getenv("GOOGLE_CREDS", "/etc/secrets/credentials.json")
+    scopes = ["https://www.googleapis.com/auth/drive.file"]
+    creds = Credentials.from_service_account_file(path, scopes=scopes)
+    # cache_discovery=False pour éviter les warnings en prod sans cache
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+def _gdrive_upload(file_path: str, file_name: str, folder_id: Optional[str], logger, req_id: str):
+    svc = _gdrive_service()
+    meta = {"name": file_name}
+    if folder_id:
+        meta["parents"] = [folder_id]
+    media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=False)
+    resp = svc.files().create(
+        body=meta,
+        media_body=media,
+        fields="id,webViewLink,webContentLink"
+    ).execute()
+    logger.info(f"[{req_id}] gdrive upload ok id={resp.get('id')}")
+    return resp
+# --------------------------------
+
 
 @app.before_request
 def _start():
@@ -63,12 +95,13 @@ def create_video():
         plan_str = request.form["plan"]
         audio_file = request.files["audio_file"]
         global_srt = request.form.get("global_srt")
+        drive_folder_id = request.form.get("drive_folder_id") or request.args.get("drive_folder_id")
 
         app.logger.info(f"[{g.req_id}] fields ok name={output_name} {width}x{height}@{fps} audio={getattr(audio_file,'filename',None)}")
 
         plan = _normalize_plan(plan_str)
 
-        # log prévision simple
+        # Prévision simple disque (indicatif)
         try:
             total_dur = sum(float(max(0.0, (seg.get("duration") or 0))) for seg in plan)
         except Exception:
@@ -90,7 +123,29 @@ def create_video():
             global_srt=global_srt,
         )
 
+        # Upload Drive si demandé
+        if drive_folder_id:
+            try:
+                gd = _gdrive_upload(out_path, output_name, drive_folder_id, app.logger, g.req_id)
+                return jsonify(
+                    status="success",
+                    drive_file_id=gd.get("id"),
+                    drive_webViewLink=gd.get("webViewLink"),
+                    width=width, height=height, fps=fps, items=len(plan)
+                )
+            except Exception as e:
+                app.logger.exception(f"[{g.req_id}] drive upload failed: {e}")
+                # on renvoie quand même le succès local
+                return jsonify(
+                    status="success",
+                    output_path=out_path,
+                    drive_error=str(e),
+                    width=width, height=height, fps=fps, items=len(plan)
+                )
+
+        # Sinon, juste succès local
         return jsonify(status="success", output_path=out_path, width=width, height=height, fps=fps, items=len(plan))
+
     except Exception as e:
         app.logger.exception(f"[{getattr(g,'req_id','?')}] create-video failed")
         return jsonify(error="internal error", detail=str(e)), 500
