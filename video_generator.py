@@ -152,7 +152,6 @@ def generate_video(plan: List[Dict[str, Any]], audio_path: str, output_name: str
     if not srt_text:
         srt_text = _build_srt_from_plan(plan)
 
-    # si pas de texte → on encode sans sous-titres
     subs_path = None
     if srt_text:
         subs_path = os.path.join(tmpdir, "subs.srt")
@@ -161,20 +160,26 @@ def generate_video(plan: List[Dict[str, Any]], audio_path: str, output_name: str
 
     # 4) encodage final unique (gravure sous-titres + audio)
     output_path = os.path.join(tmpdir, output_name)
+
+    # NOTE: on ENLÈVE -shortest pour ne PAS tronquer la vidéo si l'audio est plus court.
     base_cmd = ["ffmpeg","-y","-threads", FFMPEG_THREADS, "-i", concat_path, "-i", audio_path]
 
     if subs_path:
-        # style ASS : lisible et centré bas (Alignment=2), marge bas 60 px
-        vf = f"subtitles={subs_path}:force_style='Fontsize=36,Outline=2,Shadow=1,Alignment=2,MarginV=60'"
+        # style ASS lisible, centré bas
+        vf = f"subtitles='{subs_path}':force_style='Fontsize=36,Outline=2,Shadow=1,Alignment=2,MarginV=60'"
         cmd = base_cmd + [
             "-vf", vf,
             "-c:v","libx264","-preset", X264_PRESET,"-crf", CRF,
-            "-c:a","aac","-shortest","-movflags","+faststart", output_path
+            "-c:a","aac",
+            "-movflags","+faststart",
+            output_path
         ]
     else:
         cmd = base_cmd + [
             "-c:v","libx264","-preset", X264_PRESET,"-crf", CRF,
-            "-c:a","aac","-shortest","-movflags","+faststart", output_path
+            "-c:a","aac",
+            "-movflags","+faststart",
+            output_path
         ]
 
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
