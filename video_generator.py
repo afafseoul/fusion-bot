@@ -66,8 +66,16 @@ def _ffprobe_duration(path: str) -> float:
         return 0.0
 
 def _trim_copy(src: str, dst: str, dur: float):
+    # Remet les timestamps à zéro pour éviter des discontinuités à la concat.
     subprocess.run(
-        ["ffmpeg","-y","-t", f"{dur:.3f}", "-i", src, "-c","copy", dst],
+        ["ffmpeg","-y","-t", f"{dur:.3f}", "-i", src, "-c","copy",
+         "-avoid_negative_ts","make_zero", dst],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+def _clone_copy(src: str, dst: str):
+    subprocess.run(
+        ["ffmpeg","-y","-i", src, "-c","copy", dst],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
@@ -86,29 +94,24 @@ def _srt_time(t: float) -> str:
 
 def _build_srt_from_plan(plan: List[Dict[str,Any]]) -> str:
     """
-    Préfère des lignes SRT absolues présentes dans seg['subtitles'] (array de 1 string "A --> B").
-    Sinon, déduit à partir de start_time + duration avec seg['text'].
+    Préfère une ligne SRT absolue dans seg['subtitles'] (ex: ["A --> B"]).
+    Sinon, reconstruit via start_time + duration en utilisant seg['text'].
     """
     idx, lines = 1, []
     for seg in plan:
         txt = (seg.get("text") or "").strip()
         subs = seg.get("subtitles") or []
         if isinstance(subs, list) and subs and isinstance(subs[0], str) and "-->" in subs[0]:
-            # SRT absolu fourni
             if txt:
                 lines += [str(idx), subs[0].strip(), txt, ""]
                 idx += 1
             continue
-
-        # fallback: start_time + duration
         st = _seconds(seg.get("start_time"))
         dur = _seconds(seg.get("duration"))
         if txt and dur > 0:
-            S = _srt_time(st)
-            E = _srt_time(st + dur)
+            S = _srt_time(st); E = _srt_time(st + dur)
             lines += [str(idx), f"{S} --> {E}", txt, ""]
             idx += 1
-
     return "\n".join(lines).strip()
 
 # ---------- pipeline ----------
@@ -118,27 +121,73 @@ def generate_video(plan: List[Dict[str, Any]], audio_path: str, output_name: str
 
     tmpdir = temp_dir or tempfile.mkdtemp(prefix="fusionbot_")
 
-    # 1) segments à la bonne durée (toujours en copy)
+    # 1) segments à la bonne durée (copy/trim/repeat)
     part_paths: List[str] = []
+    real_total = 0.0
+
     for i, seg in enumerate(plan):
         url = normalize_giphy_url((seg.get("gif_url") or "").strip())
-        target = _seconds(seg.get("duration")) or 0.0
+        target = max(0.0, _seconds(seg.get("duration")))
         if logger: logger.info(f"[{req_id}] seg#{i} url={url} dur_req={target:.3f}")
         src = fetch_media(url, tmpdir, logger, req_id)
-        if target > 0:
+        src_dur = _ffprobe_duration(src) or (target if target > 0 else 2.0)
+
+        if target <= 0.0:
+            out = os.path.join(tmpdir, f"part_{i:03d}.mp4")
+            _clone_copy(src, out)
+            real = src_dur
+
+        elif target < src_dur - 0.01:
             out = os.path.join(tmpdir, f"part_{i:03d}.mp4")
             _trim_copy(src, out, target)
-            part_paths.append(out)
-            try: os.remove(src)
-            except: pass
-        else:
-            part_paths.append(src)
+            real = target
 
-    # 2) concat copy
+        elif abs(target - src_dur) <= 0.02:
+            out = os.path.join(tmpdir, f"part_{i:03d}.mp4")
+            _clone_copy(src, out)
+            real = src_dur
+
+        else:
+            # target > src_dur : duplication + reste tronqué
+            R = int(target // max(src_dur, 0.01))
+            rem = max(0.0, target - R*src_dur)
+            listfile = os.path.join(tmpdir, f"seg_{i:03d}.txt")
+
+            with open(listfile, "w") as f:
+                for _ in range(max(1, R)):
+                    f.write(f"file '{src}'\n")
+
+            tmp_outs = []
+            if rem > 0.01:
+                remf = os.path.join(tmpdir, f"rem_{i:03d}.mp4")
+                _trim_copy(src, remf, rem)
+                tmp_outs.append(remf)
+                with open(listfile, "a") as f:
+                    f.write(f"file '{remf}'\n")
+
+            out = os.path.join(tmpdir, f"part_{i:03d}.mp4")
+            _concat_copy(listfile, out)
+
+            try: os.remove(listfile)
+            except: pass
+            for p in tmp_outs:
+                try: os.remove(p)
+                except: pass
+
+            real = R*src_dur + rem
+
+        try: os.remove(src)
+        except: pass
+
+        part_paths.append(out)
+        real_total += real
+
+    if logger: logger.info(f"[{req_id}] concat {len(part_paths)} parts total≈{real_total:.3f}s")
+
+    # 2) concat finale (copy)
     list_all = os.path.join(tmpdir, "list_all.txt")
     with open(list_all, "w") as f:
-        for p in part_paths:
-            f.write(f"file '{p}'\n")
+        for p in part_paths: f.write(f"file '{p}'\n")
     concat_path = os.path.join(tmpdir, "concat.mp4")
     _concat_copy(list_all, concat_path)
     try: os.remove(list_all)
@@ -160,13 +209,11 @@ def generate_video(plan: List[Dict[str, Any]], audio_path: str, output_name: str
 
     # 4) encodage final unique (gravure sous-titres + audio)
     output_path = os.path.join(tmpdir, output_name)
-
-    # NOTE: on ENLÈVE -shortest pour ne PAS tronquer la vidéo si l'audio est plus court.
     base_cmd = ["ffmpeg","-y","-threads", FFMPEG_THREADS, "-i", concat_path, "-i", audio_path]
 
+    # Pas de -shortest ici pour ne pas tronquer si l'audio est plus court.
     if subs_path:
-        # style ASS lisible, centré bas
-        vf = f"subtitles='{subs_path}':force_style='Fontsize=36,Outline=2,Shadow=1,Alignment=2,MarginV=60'"
+        vf = f"subtitles={subs_path}:force_style='Fontsize=36,Outline=2,Shadow=1,Alignment=2,MarginV=60'"
         cmd = base_cmd + [
             "-vf", vf,
             "-c:v","libx264","-preset", X264_PRESET,"-crf", CRF,
@@ -184,7 +231,6 @@ def generate_video(plan: List[Dict[str, Any]], audio_path: str, output_name: str
 
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # clean
     try: os.remove(concat_path)
     except: pass
     if subs_path:
