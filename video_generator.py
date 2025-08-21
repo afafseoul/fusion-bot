@@ -1,184 +1,133 @@
 # video_generator.py
-import os, math, json, shutil, subprocess, tempfile, re
-from urllib.request import urlopen
+import os, math, time, shutil, subprocess, logging, urllib.request
+from typing import Any, Dict, List, Tuple
 
-def _run(cmd, logger, req_id):
-    logger.info(f"[{req_id}] CMD: {' '.join(str(c) for c in cmd)}")
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if p.stderr:
-        logger.info(f"[{req_id}] STDERR: {p.stderr[:1200]}")
+def _run(cmd: List[str], logger: logging.Logger, req_id: str):
+    logger.info(f"[{req_id}] CMD: {' '.join(map(str, cmd))}")
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    out = p.stdout.decode("utf-8", "ignore")
+    logger.info(f"[{req_id}] STDERR: {out}")
     if p.returncode != 0:
-        raise RuntimeError(f"ffmpeg/ffprobe failed ({p.returncode})")
-    return p
+        raise RuntimeError(f"Command failed: {cmd}")
 
-def _probe(path):
+def _ffprobe_duration(path: str) -> float:
     try:
-        out = subprocess.check_output([
-            "ffprobe","-v","error",
-            "-select_streams","v:0",
-            "-show_entries","stream=r_frame_rate,width,height:format=duration",
-            "-of","json", path
-        ], stderr=subprocess.STDOUT).decode("utf-8","ignore")
-        j = json.loads(out)
-        dur = float(j.get("format", {}).get("duration", 0) or 0)
-        st  = (j.get("streams") or [{}])[0]
-        fr  = st.get("r_frame_rate") or "0/1"
-        try:
-            num, den = fr.split("/")
-            fps = float(num) / float(den) if float(den) else 0.0
-        except Exception:
-            fps = 0.0
-        return {
-            "duration": max(0.0, dur),
-            "width": int(st.get("width") or 0),
-            "height": int(st.get("height") or 0),
-            "fps": fps
-        }
+        out = subprocess.check_output(
+            ["ffprobe","-v","error","-show_entries","format=duration",
+             "-of","default=noprint_wrappers=1:nokey=1", path],
+            stderr=subprocess.STDOUT
+        ).decode("utf-8","ignore").strip()
+        return max(0.0, float(out))
     except Exception:
-        return {"duration":0.0, "width":0, "height":0, "fps":0.0}
+        return 0.0
 
-def _download(url, dst, logger, req_id):
-    with urlopen(url) as r, open(dst, "wb") as f:
-        data = r.read()
-        f.write(data)
+def _download(url: str, dst: str, logger: logging.Logger, req_id: str):
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/7"})
+    with urllib.request.urlopen(req, timeout=30) as r, open(dst, "wb") as f:
+        shutil.copyfileobj(r, f)
     size = os.path.getsize(dst)
     logger.info(f"[{req_id}] download ok -> {dst} size={size}B")
-    return dst
 
-def _write_filelist(paths, list_path):
-    with open(list_path, "w", encoding="utf-8") as f:
-        for p in paths:
-            # concat demuxer: each path must be quoted
-            f.write(f"file '{p}'\n")
+def _loop_and_trim(src: str, need_dur: float, workdir: str, idx: int,
+                   logger: logging.Logger, req_id: str) -> str:
+    # Boucle en COPY jusqu’à dépasser la durée, puis coupe en COPY
+    src_dur = _ffprobe_duration(src)
+    if src_dur <= 0.05:
+        reps = max(1, math.ceil((need_dur + 0.2) / 0.5))
+    else:
+        reps = max(1, math.ceil((need_dur + 0.2) / src_dur))
 
-def _build_srt(plan, out_path, global_srt=None):
-    if global_srt:
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(global_srt)
-        return
+    seg_list = os.path.join(workdir, f"seg_{idx:03d}.txt")
+    with open(seg_list, "w") as f:
+        for _ in range(reps):
+            f.write(f"file '{src}'\n")
 
-    idx = 1
-    with open(out_path, "w", encoding="utf-8") as f:
-        for seg in plan:
-            text = seg.get("text") or ""
-            subs = seg.get("subtitles") or []
-            if not text or not subs:
-                continue
-            # on accepte 1 seule ligne SRT par segment (schema JSON)
-            line = subs[0]
-            m = re.match(r"\s*(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})", line)
-            if not m:
-                continue
-            a, b = m.group(1), m.group(2)
-            f.write(f"{idx}\n{a} --> {b}\n{text}\n\n")
-            idx += 1
+    loop_path = os.path.join(workdir, f"loop_{idx:03d}.mp4")
+    _run(["ffmpeg","-y","-f","concat","-safe","0","-i", seg_list, "-c","copy", loop_path], logger, req_id)
 
-def generate_video(
-    plan,
-    audio_path,
-    output_name,
-    temp_dir,
-    width=1080,
-    height=1920,
-    fps=30,
-    logger=None,
-    req_id="?",
-    global_srt=None
-):
-    """
-    Retourne: (out_path, debug_dict)
-    """
-    logger = logger or DummyLogger()
-
-    tmp = temp_dir
-    parts = []
-    debug = {"segments": []}
-
-    # 1) préparer chaque segment vidéo (boucle/coupe)
-    for i, seg in enumerate(plan):
-        url = seg.get("gif_url")
-        dur_req = float(seg.get("duration") or 0)
-        if not url or dur_req <= 0:
-            continue
-
-        logger.info(f"[{req_id}] seg#{i} url={url} dur_req={dur_req:.3f}")
-
-        src_path = os.path.join(tmp, f"src_{int(1000*os.times().elapsed)}_{i}.mp4")
-        _download(url, src_path, logger, req_id)
-        meta = _probe(src_path)
-        src_dur = meta["duration"] or 1.0
-
-        # Combien de répétitions pour couvrir dur_req
-        loops = max(1, math.ceil((dur_req + 0.01) / max(0.1, src_dur)))
-
-        # concat des boucles
-        seg_list = os.path.join(tmp, f"seg_{i:03d}.txt")
-        _write_filelist([src_path] * loops, seg_list)
-        looped = os.path.join(tmp, f"loop_{i:03d}.mp4")
-        _run([
-            "ffmpeg","-y","-f","concat","-safe","0","-i",seg_list,
-            "-c","copy", looped
-        ], logger, req_id)
-
-        # couper exactement à dur_req
-        part_path = os.path.join(tmp, f"part_{i:03d}.mp4")
-        _run([
-            "ffmpeg","-y","-t", f"{dur_req:.3f}",
-            "-i", looped, "-c","copy", "-avoid_negative_ts","make_zero",
-            part_path
-        ], logger, req_id)
-
-        parts.append(part_path)
-        debug["segments"].append({
-            "i": i, "url": url, "dur_req": dur_req, "src_dur": src_dur, "loops": loops,
-            "part_path": part_path
-        })
-
-    # 2) concat + normalisation (⚠️ re-encode ici pour fixer fps/timebase/SAR)
-    list_all = os.path.join(tmp, "list_all.txt")
-    _write_filelist(parts, list_all)
-    concat_path = os.path.join(tmp, "concat.mp4")
-
-    # scale/pad si width/height fournis
-    vf = (
-        f"fps={fps},"
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-        "format=yuv420p,setsar=1"
-    )
+    part_path = os.path.join(workdir, f"part_{idx:03d}.mp4")
     _run([
         "ffmpeg","-y",
-        "-f","concat","-safe","0","-i", list_all,
-        "-vf", vf,
-        "-r", str(fps),
-        "-c:v","libx264","-preset","veryfast","-crf","23",
-        "-movflags","+faststart",
-        concat_path
+        "-t", f"{need_dur:.3f}",
+        "-i", loop_path,
+        "-c","copy",
+        "-avoid_negative_ts","make_zero",
+        part_path
     ], logger, req_id)
 
-    # 3) SRT (global ou construit depuis plan)
-    subs_path = os.path.join(tmp, "subs.srt")
-    _build_srt(plan, subs_path, global_srt=global_srt)
+    return part_path
 
-    # 4) export final avec audio + sous-titres
-    out_path = os.path.join(tmp, output_name)
-    _run([
-        "ffmpeg","-y","-threads","1",
-        "-i", concat_path,
-        "-i", audio_path,
-        "-vf", f"subtitles={subs_path}:force_style='Fontsize=36,Outline=2,Shadow=1,Alignment=2,MarginV=60'",
-        "-c:v","libx264","-preset","veryfast","-crf","23",
-        "-r", str(fps),
-        "-c:a","aac",
-        "-shortest",
-        "-movflags","+faststart",
-        out_path
-    ], logger, req_id)
+def generate_video(
+    plan: List[Dict[str, Any]],
+    audio_path: str,
+    output_name: str,
+    temp_dir: str,
+    width: int,      # ignorés volontairement (pas de resize)
+    height: int,     # ignorés volontairement (pas de resize)
+    fps: int,        # ignoré (pas de FPS forcé)
+    logger: logging.Logger,
+    req_id: str,
+    global_srt: str = None  # ignoré (pas de sous-titres)
+) -> Tuple[str, Dict[str, Any]]:
 
+    parts: List[str] = []
+    for i, seg in enumerate(plan):
+        url = seg.get("gif_url") or seg.get("url")
+        if not url:
+            raise ValueError(f"plan[{i}] missing 'gif_url' or 'url'")
+        dur_req = float(seg.get("duration") or 0.0)
+        logger.info(f"[{req_id}] seg#{i} url={url} dur_req={dur_req:.3f}")
+
+        src_path = os.path.join(temp_dir, f"src_{int(time.time()*1000)}_{i}.mp4")
+        _download(url, src_path, logger, req_id)
+
+        part_path = _loop_and_trim(src_path, dur_req, temp_dir, i, logger, req_id)
+        parts.append(part_path)
+
+    list_all = os.path.join(temp_dir, "list_all.txt")
+    with open(list_all, "w") as f:
+        for p in parts:
+            f.write(f"file '{p}'\n")
+
+    out_path = os.path.join(temp_dir, output_name)
+
+    # Tentative 1 : concat 100% en COPY pour la vidéo (ultra-rapide),
+    # on n'encode que l'audio en AAC (mp4 friendly).
+    try:
+        cmd = [
+            "ffmpeg","-y",
+            "-f","concat","-safe","0","-i", list_all,   # 0:v (collage)
+            "-i", audio_path,                            # 1:a
+            "-map","0:v:0","-map","1:a:0",
+            "-c:v","copy",                               # pas d'encodage vidéo
+            "-c:a","aac",                                # audio -> AAC (rapide)
+            "-shortest","-movflags","+faststart",
+            out_path
+        ]
+        _run(cmd, logger, req_id)
+        mode = "copy_video"
+    except Exception as e:
+        # Fallback si COPY échoue (paramètres codecs différents) :
+        # réencodage vidéo en une seule passe, preset ultrafast.
+        logger.warning(f"[{req_id}] fast concat failed, fallback ultrafast reencode: {e}")
+        cmd = [
+            "ffmpeg","-y",
+            "-f","concat","-safe","0","-i", list_all,
+            "-i", audio_path,
+            "-map","0:v:0","-map","1:a:0",
+            "-c:v","libx264","-preset", os.getenv("X264_PRESET","ultrafast"),
+            "-crf", os.getenv("X264_CRF","23"),
+            "-c:a","aac",
+            "-shortest","-movflags","+faststart",
+            out_path
+        ]
+        _run(cmd, logger, req_id)
+        mode = "reencode_fallback"
+
+    debug = {
+        "status": "ok",
+        "items": len(parts),
+        "mode": mode,
+        "notes": "no resize, no fps, no subtitles"
+    }
     return out_path, debug
-
-
-class DummyLogger:
-    def info(self, *a, **k): pass
-    def warning(self, *a, **k): pass
-    def error(self, *a, **k): pass
