@@ -65,15 +65,32 @@ def _parse_int(v, d):
     except: return d
 
 def _normalize_plan(raw: Any) -> List[Dict[str, Any]]:
-    if raw is None: raise ValueError("Missing 'plan'")
-    if isinstance(raw, (bytes, bytearray)): raw = raw.decode("utf-8", "ignore")
+    """
+    Tolérante aux petits JSON cassés (ex: guillemet non terminé).
+    Accepte:
+      {"plan":[{...}, ...]}  ou directement  [{...}, ...]
+    """
+    if raw is None:
+        raise ValueError("Missing 'plan'")
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "ignore")
     if isinstance(raw, str):
         raw = raw.strip()
         app.logger.info(f"[{g.req_id}] plan_len={len(raw)} head={raw[:400].replace(chr(10),' ')}")
-        raw = json.loads(raw)
-    if isinstance(raw, dict) and "plan" in raw: raw = raw["plan"]
-    if not isinstance(raw, list): raise ValueError("plan must be a JSON array")
-    if not raw: raise ValueError("plan is empty")
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            last = raw.rfind("}")
+            if last != -1:
+                raw = json.loads(raw[:last+1])
+            else:
+                raise
+    if isinstance(raw, dict) and "plan" in raw:
+        raw = raw["plan"]
+    if not isinstance(raw, list):
+        raise ValueError("plan must be a JSON array")
+    if not raw:
+        raise ValueError("plan is empty")
     return raw
 
 @app.get("/")
@@ -85,9 +102,9 @@ def create_video():
     workdir = None
     try:
         output_name = request.form["output_name"]
-        width  = _parse_int(request.form.get("width", 1080), 1080)    # ignorés en fast-copy
-        height = _parse_int(request.form.get("height", 1920), 1920)   # ignorés en fast-copy
-        fps    = _parse_int(request.form.get("fps", 30), 30)          # ignorés en fast-copy
+        width  = _parse_int(request.form.get("width", 1080), 1080)
+        height = _parse_int(request.form.get("height", 1920), 1920)
+        fps    = _parse_int(request.form.get("fps", 30), 30)
         plan_str = request.form["plan"]
         audio_file = request.files["audio_file"]
         global_srt = request.form.get("global_srt")
