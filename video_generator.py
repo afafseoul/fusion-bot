@@ -1,12 +1,13 @@
-# video_generator.py — SIMPLE "TEL QUEL" (no resize, no fps, no video reencode)
-import os, math, time, shutil, subprocess, logging, urllib.request, json
+# video_generator.py — réencodage UNIFORME par segment (codec/résolution/FPS/timescale)
+import os, time, math, shutil, subprocess, logging, urllib.request, json, shlex
 from typing import Any, Dict, List, Tuple
 
-def _run(cmd: List[str], logger: logging.Logger, req_id: str):
-    logger.info(f"[{req_id}] CMD: {' '.join(map(str, cmd))}")
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    out = p.stdout.decode("utf-8", "ignore")
-    logger.info(f"[{req_id}] STDERR: {out}")
+UA = "Mozilla/5.0 (compatible; RenderBot/1.0)"
+
+def _run(cmd: str, logger: logging.Logger, req_id: str):
+    logger.info(f"[{req_id}] CMD: {cmd}")
+    p = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    logger.info(f"[{req_id}] STDERR: {p.stdout}")
     if p.returncode != 0:
         raise RuntimeError(f"Command failed: {cmd}")
 
@@ -22,124 +23,137 @@ def _ffprobe_duration(path: str) -> float:
         return 0.0
 
 def _download(url: str, dst: str, logger: logging.Logger, req_id: str):
-    req = urllib.request.Request(url, headers={"User-Agent": "curl/7"})
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=30) as r, open(dst, "wb") as f:
         shutil.copyfileobj(r, f)
+    if os.path.getsize(dst) <= 0:
+        raise RuntimeError("downloaded file is empty")
     logger.info(f"[{req_id}] download ok -> {dst} size={os.path.getsize(dst)}B")
 
-def _loop_and_trim_copy(src: str, need_dur: float, workdir: str, idx: int,
-                        logger: logging.Logger, req_id: str) -> str:
+def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
+                    logger: logging.Logger, req_id: str):
     """
-    Répète la source en COPY jusqu'à couvrir need_dur, puis coupe en COPY.
-    Aucun filtre, aucun -r, aucun resize.
+    Ré-encode chaque segment avec:
+      - libx264 + yuv420p
+      - scale+pad -> WxH
+      - fps constant (CFR) + vsync cfr
+      - timescale unifié (video_track_timescale=90000)
+      - loop de la source et trim à need_dur
     """
-    src_dur = _ffprobe_duration(src)
-    if src_dur <= 0.05:
-        reps = max(1, math.ceil((need_dur + 0.2) / 0.5))
-    else:
-        reps = max(1, math.ceil((need_dur + 0.2) / src_dur))
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    vf = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
+        f"fps={fps}"
+    )
+    cmd = (
+        "ffmpeg -y -hide_banner -loglevel error "
+        f"-stream_loop -1 -t {need_dur:.3f} -i {shlex.quote(src)} "
+        f"-vf \"{vf}\" -pix_fmt yuv420p -r {fps} -vsync cfr "
+        "-c:v libx264 -preset superfast -crf 26 "
+        "-movflags +faststart "
+        "-video_track_timescale 90000 "
+        f"{shlex.quote(dst)}"
+    )
+    _run(cmd, logger, req_id)
 
-    seg_list = os.path.join(workdir, f"seg_{idx:03d}.txt")
-    with open(seg_list, "w") as f:
-        for _ in range(reps):
-            f.write(f"file '{src}'\n")
-
-    loop_path = os.path.join(workdir, f"loop_{idx:03d}.mp4")
-    _run(["ffmpeg","-y","-f","concat","-safe","0","-i", seg_list, "-c","copy", loop_path], logger, req_id)
-
-    part_path = os.path.join(workdir, f"part_{idx:03d}.mp4")
-    _run([
-        "ffmpeg","-y",
-        "-t", f"{need_dur:.3f}",
-        "-i", loop_path,
-        "-c","copy",
-        "-avoid_negative_ts","make_zero",
-        part_path
-    ], logger, req_id)
-    return part_path
-
-def _concat_mp4_copy(parts: List[str], out_path: str, logger: logging.Logger, req_id: str):
+def _concat_copy_strict(parts: List[str], out_path: str, logger: logging.Logger, req_id: str) -> str:
+    """
+    Concat en COPY via demuxer. Les segments sont déjà uniformisés.
+    Ajoute genpts/avoid_negative_ts pour éviter les warnings de DTS.
+    """
     lst = out_path + ".txt"
     with open(lst, "w") as f:
         for p in parts:
             f.write(f"file '{p}'\n")
-    _run([
-        "ffmpeg","-y",
-        "-f","concat","-safe","0","-i", lst,
-        "-c","copy","-movflags","+faststart",
-        out_path
-    ], logger, req_id)
 
-def _concat_ts_copy(parts: List[str], out_path: str, logger: logging.Logger, req_id: str):
-    """
-    Fallback sans réencodage vidéo :
-    1) remux chaque MP4 en TS (annexb) en copy
-    2) concat 'concat:ts1|ts2|...' en copy
-    3) remux en MP4 en copy
-    """
-    ts_paths = []
-    for i, p in enumerate(parts):
-        t = p.rsplit(".",1)[0] + ".ts"
-        _run(["ffmpeg","-y","-i", p, "-c","copy", "-bsf:v","h264_mp4toannexb", "-f","mpegts", t], logger, req_id)
-        ts_paths.append(t)
-    joined = "concat:" + "|".join(ts_paths)
-    tmp_mp4 = out_path + ".video.mp4"
-    _run(["ffmpeg","-y","-i", joined, "-c","copy", "-movflags","+faststart", tmp_mp4], logger, req_id)
-    shutil.move(tmp_mp4, out_path)
+    cmd = (
+        "ffmpeg -y -hide_banner -loglevel error "
+        f"-f concat -safe 0 -i {shlex.quote(lst)} "
+        "-fflags +genpts -avoid_negative_ts make_zero "
+        "-c copy -movflags +faststart "
+        f"{shlex.quote(out_path)}"
+    )
+    try:
+        _run(cmd, logger, req_id)
+        return "concat_copy"
+    except Exception as e:
+        # Fallback (rare) : ré-encode le final via concat filter (toujours uniforme → rapide)
+        inputs = " ".join(f"-i {shlex.quote(p)}" for p in parts)
+        n = len(parts)
+        maps = "".join(f"[{i}:v:0]" for i in range(n))
+        cmd2 = (
+            f"ffmpeg -y -hide_banner -loglevel error {inputs} "
+            f"-filter_complex \"{maps}concat=n={n}:v=1:a=0[v]\" "
+            "-map \"[v]\" -c:v libx264 -preset superfast -crf 26 "
+            "-pix_fmt yuv420p -movflags +faststart -r 30 "
+            "-video_track_timescale 90000 "
+            f"{shlex.quote(out_path)}"
+        )
+        _run(cmd2, logger, req_id)
+        return "concat_filter"
+
+def _mux_audio(video_path: str, audio_path: str, out_path: str, logger: logging.Logger, req_id: str):
+    cmd = (
+        "ffmpeg -y -hide_banner -loglevel error "
+        f"-i {shlex.quote(video_path)} -i {shlex.quote(audio_path)} "
+        "-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 128k "
+        "-shortest -movflags +faststart "
+        f"{shlex.quote(out_path)}"
+    )
+    _run(cmd, logger, req_id)
 
 def generate_video(
     plan: List[Dict[str, Any]],
     audio_path: str,
     output_name: str,
     temp_dir: str,
-    width: int,      # ignorés
-    height: int,     # ignorés
-    fps: int,        # ignoré
+    width: int,
+    height: int,
+    fps: int,
     logger: logging.Logger,
     req_id: str,
-    global_srt: str = None  # ignoré
+    global_srt: str = None
 ):
     parts: List[str] = []
+
     for i, seg in enumerate(plan):
-        url = seg.get("gif_url") or seg.get("url")
+        url = seg.get("gif_url") or seg.get("url") or seg.get("video_url")
         if not url:
             raise ValueError(f"plan[{i}] missing 'gif_url' or 'url'")
-        dur = float(seg.get("duration") or 0.0)
-        if dur <= 0:  # si pas de durée -> on prend le clip tel quel
-            dur = _ffprobe_duration(url) or 0.001
+        try:
+            dur = float(seg.get("duration") or 0.0)
+        except Exception:
+            dur = 0.0
+        if dur <= 0.0:
+            dur = 0.5  # mini sécurité si pas de durée fournie
+
         logger.info(f"[{req_id}] seg#{i} url={url} dur_req={dur:.3f}")
 
         src_path = os.path.join(temp_dir, f"src_{int(time.time()*1000)}_{i}.mp4")
         _download(url, src_path, logger, req_id)
 
-        part_path = _loop_and_trim_copy(src_path, dur, temp_dir, i, logger, req_id)
+        part_path = os.path.join(temp_dir, f"part_{i:03d}.mp4")
+        _encode_uniform(src=src_path, dst=part_path, width=width, height=height, fps=fps,
+                        need_dur=dur, logger=logger, req_id=req_id)
         parts.append(part_path)
 
     if not parts:
         raise ValueError("empty parts")
 
-    # 1) Concat vidéo en COPY (MP4). Si échec (paramètres différents), fallback TS.
+    # Concat vidéo
     video_only = os.path.join(temp_dir, "_video.mp4")
-    try:
-        _concat_mp4_copy(parts, video_only, logger, req_id)
-        mode = "concat_mp4_copy"
-    except Exception as e:
-        logger.warning(f"[{req_id}] MP4 copy concat failed, trying TS copy concat: {e}")
-        _concat_ts_copy(parts, video_only, logger, req_id)
-        mode = "concat_ts_copy"
+    mode = _concat_copy_strict(parts, video_only, logger, req_id)
 
-    # 2) Mux audio (audio -> AAC), vidéo en COPY.
+    # Mux audio
     out_path = os.path.join(temp_dir, output_name)
-    _run([
-        "ffmpeg","-y",
-        "-i", video_only,
-        "-i", audio_path,
-        "-map","0:v:0","-map","1:a:0",
-        "-c:v","copy",
-        "-c:a","aac",
-        "-shortest","-movflags","+faststart",
-        out_path
-    ], logger, req_id)
+    _mux_audio(video_only, audio_path, out_path, logger, req_id)
 
-    debug = {"status":"ok","items":len(parts),"mode":mode,"notes":"no resize, no fps, no video reencode; audio->AAC"}
+    debug = {
+        "status": "ok",
+        "items": len(parts),
+        "mode": mode,
+        "notes": "uniformize segments (libx264,yuv420p,WxH,fps,timescale) -> concat copy -> mux audio"
+    }
     return out_path, debug
