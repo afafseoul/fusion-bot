@@ -22,35 +22,81 @@ def _ffprobe_duration(path: str) -> float:
     except Exception:
         return 0.0
 
-def _download(url: str, dst: str, logger: logging.Logger, req_id: str):
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=30) as r, open(dst, "wb") as f:
-        shutil.copyfileobj(r, f)
-    if os.path.getsize(dst) <= 0:
+# ---- Helpers ajoutés ----
+def _ffprobe_json(path: str) -> dict:
+    try:
+        out = subprocess.check_output([
+            "ffprobe","-v","error","-print_format","json",
+            "-show_format","-show_streams", path
+        ], stderr=subprocess.STDOUT, timeout=10)
+        return json.loads(out.decode("utf-8","ignore"))
+    except Exception:
+        return {}
+
+def _kind(path: str) -> Tuple[bool, bool]:
+    """(has_video, is_gif) pour un fichier local"""
+    info = _ffprobe_json(path)
+    fm = (info.get("format",{}) or {}).get("format_name","")
+    has_video = any((s or {}).get("codec_type") == "video" for s in info.get("streams",[]) )
+    is_gif = ("gif" in fm)
+    return has_video, is_gif
+# -------------------------
+
+def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> str:
+    """
+    Télécharge URL (Drive/Giphy/etc.). Retourne le chemin final AVEC la bonne extension.
+    Si Content-Type=gif -> .gif ; mp4 -> .mp4 ; sinon -> tente via l’URL, sinon .bin
+    """
+    os.makedirs(os.path.dirname(dst_noext), exist_ok=True)
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": "https://www.pinterest.com/"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        ct = r.info().get_content_type() or ""
+        if "gif" in ct:
+            ext = ".gif"
+        elif "mp4" in ct or "video/" in ct:
+            ext = ".mp4"
+        else:
+            low = url.lower()
+            if ".gif" in low:   ext = ".gif"
+            elif ".mp4" in low: ext = ".mp4"
+            else:               ext = ".bin"
+        dst = dst_noext + ext
+        with open(dst, "wb") as f:
+            shutil.copyfileobj(r, f)
+    size = os.path.getsize(dst)
+    if size <= 0:
         raise RuntimeError("downloaded file is empty")
-    logger.info(f"[{req_id}] download ok -> {dst} size={os.path.getsize(dst)}B")
+    logger.info(f"[{req_id}] download ok -> {dst} size={size}B ct={ct}")
+    return dst
 
 def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
                     logger: logging.Logger, req_id: str):
     """
-    Ré-encode chaque segment avec:
-      - libx264 + yuv420p
-      - scale+pad -> WxH
-      - fps constant (CFR) + vsync cfr
-      - timescale unifié (video_track_timescale=90000)
-      - loop de la source et trim à need_dur
+    Uniformise chaque segment en H.264 1080x1920@fps + yuv420p.
+    - GIF local  : -ignore_loop 0 (pas de -stream_loop)
+    - MP4 local  : -stream_loop -1 (boucle) + -t need_dur
+    - M3U8 (URL) : lecture réseau directe + -t need_dur
     """
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    vf = (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
-        f"fps={fps}"
-    )
+    vf = (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+          f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
+          f"fps={fps}")
+
+    src_low = src.lower()
+    is_m3u8 = (src_low.startswith("http") and ".m3u8" in src_low)
+
+    if is_m3u8:
+        in_flags = ('-protocol_whitelist "file,http,https,tcp,tls,crypto" '
+                    f'-t {need_dur:.3f} -i {shlex.quote(src)}')
+    elif src_low.endswith(".gif"):
+        in_flags = f'-ignore_loop 0 -t {need_dur:.3f} -i {shlex.quote(src)}'
+    else:
+        in_flags = f'-stream_loop -1 -t {need_dur:.3f} -i {shlex.quote(src)}'
+
     cmd = (
         "ffmpeg -y -hide_banner -loglevel error "
-        f"-stream_loop -1 -t {need_dur:.3f} -i {shlex.quote(src)} "
-        f"-vf \"{vf}\" -pix_fmt yuv420p -r {fps} -vsync cfr "
+        f"{in_flags} "
+        f'-vf "{vf}" -pix_fmt yuv420p -r {fps} -vsync cfr '
         "-c:v libx264 -preset superfast -crf 26 "
         "-movflags +faststart "
         "-video_track_timescale 90000 "
@@ -78,8 +124,7 @@ def _concat_copy_strict(parts: List[str], out_path: str, logger: logging.Logger,
     try:
         _run(cmd, logger, req_id)
         return "concat_copy"
-    except Exception as e:
-        # Fallback (rare) : ré-encode le final via concat filter (toujours uniforme → rapide)
+    except Exception:
         inputs = " ".join(f"-i {shlex.quote(p)}" for p in parts)
         n = len(parts)
         maps = "".join(f"[{i}:v:0]" for i in range(n))
@@ -127,15 +172,24 @@ def generate_video(
         except Exception:
             dur = 0.0
         if dur <= 0.0:
-            dur = 0.5  # mini sécurité si pas de durée fournie
+            dur = 0.5
 
         logger.info(f"[{req_id}] seg#{i} url={url} dur_req={dur:.3f}")
 
-        src_path = os.path.join(temp_dir, f"src_{int(time.time()*1000)}_{i}.mp4")
-        _download(url, src_path, logger, req_id)
+        # HLS Pinterest: on ne télécharge pas, on lit l'URL .m3u8
+        if url.lower().startswith("http") and ".m3u8" in url.lower():
+            src_for_encode = url
+        else:
+            base = os.path.join(temp_dir, f"src_{int(time.time()*1000)}_{i}")
+            src_for_encode = _download(url, base, logger, req_id)
+            has_video, is_gif = _kind(src_for_encode)
+            if not (has_video or is_gif):
+                raise RuntimeError("Downloaded file is not a valid video/gif. "
+                                   "Drive peut avoir renvoyé une page HTML. "
+                                   "Assure le partage public et utilise 'uc?export=download&id=...'.")
 
         part_path = os.path.join(temp_dir, f"part_{i:03d}.mp4")
-        _encode_uniform(src=src_path, dst=part_path, width=width, height=height, fps=fps,
+        _encode_uniform(src=src_for_encode, dst=part_path, width=width, height=height, fps=fps,
                         need_dur=dur, logger=logger, req_id=req_id)
         parts.append(part_path)
 
