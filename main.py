@@ -100,6 +100,10 @@ def _normalize_plan(raw: Any) -> List[Dict[str, Any]]:
         raise ValueError("plan is empty")
     return raw
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "fusion-bot"}, 200
+
 # =========================
 #         SYNC API
 # =========================
