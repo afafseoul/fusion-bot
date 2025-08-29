@@ -104,3 +104,58 @@ def make_text_clip(
         clip = clip.set_position(("center", "bottom")).margin(bottom=y_margin, opacity=0)
     clip = clip.fadein(0.15).fadeout(0.15)
     return clip
+
+
+# === Sous-titres (helpers SRT) =====================
+
+# Style "CapCut box" : texte blanc, fond noir semi-opaque, bas-centre
+SUB_STYLE_CAPCUT = (
+    "FontName=DejaVu Sans,"
+    "Fontsize=44,"
+    "PrimaryColour=&H00FFFFFF&,"
+    "BackColour=&H66000000&,"
+    "BorderStyle=3,Outline=0,Shadow=0,"
+    "Alignment=2,MarginV=72"
+)
+
+def make_segment_srt(times, text, seg_start, seg_dur, out_path):
+    """
+    Découpe une ligne SRT ABSOLUE (ex: '00:00:05,000 --> 00:00:07,500')
+    du plan sur la fenêtre locale [0..seg_dur] du segment.
+    Écrit un .srt minimal. Retourne le chemin.
+    """
+    def parse(ts):
+        h, m, s = ts.split(":"); s, ms = s.split(",")
+        return (int(h)*3600 + int(m)*60 + int(s))*1000 + int(ms)
+
+    def fmt(ms):
+        ms = max(0, int(ms))
+        h = ms // 3_600_000; ms %= 3_600_000
+        m = ms // 60_000;    ms %= 60_000
+        s = ms // 1000;      ms %= 1000
+        return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+    Aseg = int(float(seg_start) * 1000)
+    Bseg = int((float(seg_start) + float(seg_dur)) * 1000)
+
+    lines, idx = [], 1
+    for t in (times or []):
+        if not t or "-->" not in t:
+            continue
+        a, b = [x.strip() for x in t.split("-->")]
+        A, B = parse(a), parse(b)
+        if B <= Aseg or A >= Bseg:
+            continue
+        A = max(A, Aseg) - Aseg
+        B = min(B, Bseg) - Aseg
+        txt = (text or "").strip()
+        lines.append(f"{idx}\n{fmt(A)} --> {fmt(B)}\n{txt}\n")
+        idx += 1
+
+    if not lines and (text or "").strip():
+        # Fallback: tout le segment
+        lines.append(f"1\n00:00:00,000 --> {fmt(int(float(seg_dur)*1000))}\n{(text or '').strip()}\n")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return out_path
