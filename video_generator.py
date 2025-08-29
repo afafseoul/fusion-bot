@@ -122,15 +122,34 @@ def generate_video(
     logger: logging.Logger,
     req_id: str,
     sub_style: str = DEFAULT_SUB_STYLE,
+    # nouveaux params tolérés par main.py / Make
+    global_srt: str = None,
+    burn_mode: str = None,
+    **kwargs
 ):
+    """
+    burn_mode:
+      - "segment" (défaut si None) : burn des sous-titres par segment (style CapCut)
+      - "none"                     : pas de sous-titres gravés
+    global_srt est ignoré ici (on suit le plan segmenté).
+    """
+    # normalisation du mode
+    mode_burn = (burn_mode or "segment").lower().strip()
+    burn_segments = (mode_burn != "none")
+
     parts: List[str] = []
-    has_seg_times = any((seg.get("subtitles") for seg in plan))
+    has_seg_times = burn_segments and any((seg.get("subtitles") for seg in plan))
     t_running = 0.0
 
     for i, seg in enumerate(plan):
         url = seg.get("gif_url") or seg.get("url") or seg.get("video_url")
         if not url: raise ValueError(f"plan[{i}] missing url/gif_url")
-        dur = float(seg.get("duration") or 0.5) or 0.5
+        try:
+            dur = float(seg.get("duration") or 0.0)
+        except Exception:
+            dur = 0.0
+        if dur <= 0.0:
+            dur = 0.5
         start = float(seg.get("start_time")) if seg.get("start_time") is not None else t_running
         txt = (seg.get("text") or "").strip()
         logger.info(f"[{req_id}] seg#{i} start={start:.3f} dur={dur:.3f} url={url}")
@@ -145,7 +164,7 @@ def generate_video(
             if not (has_video or is_gif):
                 raise RuntimeError("Downloaded file is not media (got HTML). Lien Drive direct requis.")
 
-        # SRT segment (si le plan fournit des fenêtres)
+        # SRT segment (si le plan fournit des fenêtres && burn actif)
         seg_srt = None
         if has_seg_times:
             seg_srt = os.path.join(temp_dir, f"seg_{i:03d}.srt")
@@ -156,16 +175,23 @@ def generate_video(
         _encode_uniform(src_for_encode, part_path, width, height, fps, dur, logger, req_id,
                         subs_path=seg_srt, sub_style=sub_style)
         parts.append(part_path)
-        if seg.get("start_time") is None: t_running += dur
+        if seg.get("start_time") is None:
+            t_running += dur
 
-    if not parts: raise ValueError("empty parts")
+    if not parts:
+        raise ValueError("empty parts")
 
     # concat (copy) -> mux audio (copy vidéo)
     video_only = os.path.join(temp_dir, "_video.mp4")
-    mode = _concat_copy_strict(parts, video_only, logger, req_id)
+    concat_mode = _concat_copy_strict(parts, video_only, logger, req_id)
 
     out_path = os.path.join(temp_dir, output_name)
     _mux_audio(video_only, audio_path, out_path, logger, req_id)
 
-    debug = {"mode": mode, "subs": "burned_per_segment" if has_seg_times else "none", "items": len(parts)}
+    debug = {
+        "mode": concat_mode,
+        "subs": ("burned_per_segment" if has_seg_times else ("none" if not burn_segments else "no_times")),
+        "items": len(parts),
+        "burn_mode": mode_burn,
+    }
     return out_path, debug
