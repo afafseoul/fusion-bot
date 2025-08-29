@@ -44,17 +44,18 @@ def _ffprobe_json(path: str) -> dict:
         return {}
 
 def _kind(path: str) -> Tuple[bool, bool]:
-    """(has_video, is_gif) pour un fichier local"""
-    info = _ffprobe_json(path)
-    fm = (info.get("format",{}) or {}).get("format_name","") or ""
-    has_video = any((s or {}).get("codec_type") == "video" for s in info.get("streams",[]) )
-    is_gif = ("gif" in fm.lower())
-    return has_video, is_gif
+    try:
+        j = _ffprobe_json(path)
+        has_video = any(s.get("codec_type") == "video" for s in j.get("streams", []))
+        is_gif    = (path.lower().endswith(".gif"))
+        return has_video, is_gif
+    except Exception:
+        return False, False
 
 # ------------------- SRT helpers -------------------
-def _fmt_srt_time(sec: float) -> str:
-    if sec < 0: sec = 0.0
-    ms = int(round(sec * 1000.0))
+def _fmt_srt_time(t: float) -> str:
+    t = max(0.0, float(t))
+    ms = int(round(t * 1000))
     hh = ms // 3_600_000
     ms %= 3_600_000
     mm = ms // 60_000
@@ -64,9 +65,10 @@ def _fmt_srt_time(sec: float) -> str:
     return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
 
 def _build_srt_from_plan(plan: List[Dict[str, Any]]) -> str:
-    """Construit un SRT à partir des champs du plan:
-       - si 'start_time' existe -> utilisé, sinon cumul des 'duration'
-       - 'text' = contenu affiché
+    """Construit un SRT à partir du plan.
+       Priorité:
+         1) seg["subtitles"] : liste de "HH:MM:SS,ms --> HH:MM:SS,ms" (utilise seg["text"])
+         2) sinon: start_time + duration + text
     """
     lines: List[str] = []
     t = 0.0
@@ -74,21 +76,30 @@ def _build_srt_from_plan(plan: List[Dict[str, Any]]) -> str:
     for seg in plan:
         txt = str(seg.get("text") or "").strip()
         if not txt:
-            # rien à sous-titrer pour ce segment
             dur = float(seg.get("duration") or 0.0)
-            t += max(0.0, dur) if seg.get("start_time") is None else 0.0
+            if seg.get("start_time") is None:
+                t += max(0.0, dur)
             continue
 
+        # 1) sous-titres explicites
+        times = seg.get("subtitles") or []
+        used = False
+        for tline in times:
+            if ("-->" not in str(tline)):
+                continue
+            used = True
+            lines.append(f"{idx}\n{tline}\n{txt}\n")
+            idx += 1
+        if used:
+            continue
+
+        # 2) fallback: start_time + duration
         dur = float(seg.get("duration") or 0.0)
         start = float(seg.get("start_time")) if seg.get("start_time") is not None else t
         end = max(start + max(0.0, dur), start + 0.2)
-
         start_s = _fmt_srt_time(start)
         end_s   = _fmt_srt_time(end)
-        # éclater les \n éventuels sans fioritures
-        block = f"{idx}\n{start_s} --> {end_s}\n{txt}\n"
-        lines.append(block)
-
+        lines.append(f"{idx}\n{start_s} --> {end_s}\n{txt}\n")
         idx += 1
         if seg.get("start_time") is None:
             t = end
@@ -109,12 +120,13 @@ def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> 
         ct = (r.info().get_content_type() or "").lower()
         if "gif" in ct:
             ext = ".gif"
-        elif "mp4" in ct or "video/" in ct:
+        elif "mp4" in ct:
             ext = ".mp4"
         else:
-            low = url.lower()
-            if ".gif" in low:   ext = ".gif"
-            elif ".mp4" in low: ext = ".mp4"
+            # déduit depuis l’URL
+            ul = url.lower()
+            if ul.endswith(".gif"): ext = ".gif"
+            elif ul.endswith(".mp4"): ext = ".mp4"
             else:               ext = ".bin"
         dst = dst_noext + ext
         with open(dst, "wb") as f:
@@ -145,8 +157,8 @@ def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_
     """
     Uniformise chaque segment en H.264 WxH@fps + yuv420p.
     - GIF local  : -ignore_loop 0 (pas de -stream_loop)
-    - MP4 local  : -stream_loop -1 (boucle) + -t need_dur
-    - M3U8 (URL) : lecture réseau directe + -t need_dur
+    - MP4 local  : -stream_loop -1 + -t need_dur
+    - M3U8 (URL) : lecture réseau + -t need_dur
     """
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     vf = (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
@@ -176,18 +188,14 @@ def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_
     _run(cmd, logger, req_id)
 
 def _concat_copy_strict(parts: List[str], out_path: str, logger: logging.Logger, req_id: str) -> str:
-    """
-    Concat en COPY via demuxer. Les segments sont déjà uniformisés.
-    Ajoute genpts/avoid_negative_ts pour éviter les warnings de DTS.
-    """
-    lst = out_path + ".txt"
-    with open(lst, "w") as f:
+    # concat demuxer (copy) -> le plus rapide
+    list_path = out_path + ".txt"
+    with open(list_path, "w") as f:
         for p in parts:
-            f.write(f"file '{p}'\n")
-
+            f.write(f"file '{os.path.abspath(p)}'\n")
     cmd = (
         "ffmpeg -y -hide_banner -loglevel error "
-        f"-f concat -safe 0 -i {shlex.quote(lst)} "
+        f"-f concat -safe 0 -i {shlex.quote(list_path)} "
         "-fflags +genpts -avoid_negative_ts make_zero "
         "-c copy -movflags +faststart "
         f"{shlex.quote(out_path)}"
@@ -237,6 +245,23 @@ def _mux_audio(video_path: str, audio_path: str, out_path: str, logger: logging.
         )
     _run(cmd, logger, req_id)
 
+def _add_soft_subs(video_in: str, srt_text: str, out_path: str, logger: logging.Logger, req_id: str, lang: str = "fr"):
+    """Ajoute la piste sous-titres en MOV_TEXT sans réencoder la vidéo (copy streams)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        srt_path = os.path.join(td, "captions.srt")
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write((srt_text or "").strip() + ("\n" if srt_text else ""))
+        cmd = (
+            "ffmpeg -y -hide_banner -loglevel error "
+            f"-i {shlex.quote(video_in)} -i {shlex.quote(srt_path)} "
+            "-map 0:v -map 0:a? -map 1:0 -c copy -c:s mov_text "
+            f"-metadata:s:s:0 language={lang} -disposition:s:0 default "
+            f"{shlex.quote(out_path)}"
+        )
+        _run(cmd, logger, req_id)
+    return out_path
+
 # ------------------- pipeline -------------------
 def generate_video(
     plan: List[Dict[str, Any]],
@@ -278,8 +303,6 @@ def generate_video(
         if dur <= 0.0:
             dur = 0.5
 
-        logger.info(f"[{req_id}] seg#{i} url={url} dur_req={dur:.3f}")
-
         # .m3u8: on lit en réseau (pas de download)
         if url.lower().startswith("http") and ".m3u8" in url.lower():
             src_for_encode = url
@@ -305,7 +328,7 @@ def generate_video(
     video_only = os.path.join(temp_dir, "_video.mp4")
     mode = _concat_copy_strict(parts, video_only, logger, req_id)
 
-    # 4) Mux audio (+/- burn subs)
+    # 4) Mux audio (+ éventuellement burn des sous-titres)
     out_path = os.path.join(temp_dir, output_name)
     _mux_audio(
         video_only, audio_path, out_path, logger, req_id,
@@ -313,13 +336,19 @@ def generate_video(
         sub_style=sub_style or DEFAULT_SUB_STYLE
     )
 
+    # 5) Soft subtitles (mov_text) si on NE brûle PAS
+    if srt_path and not burn_subs:
+        out_soft = out_path.replace(".mp4", "_subs.mp4")
+        _add_soft_subs(out_path, open(srt_path, "r", encoding="utf-8").read(), out_soft, logger, req_id, lang="fr")
+        out_path = out_soft
+
     debug = {
         "status": "ok",
         "items": len(parts),
         "mode": mode,
         "burned_subs": bool(srt_path and burn_subs),
         "srt_emitted": (bool(srt_path) and not burn_subs),
-        "notes": "uniformize segments -> concat copy -> mux audio (+/- burn subs via libass)"
+        "notes": "uniformize segments -> concat copy -> mux audio (+burn) OR add soft subs (mov_text)"
     }
     if srt_path and not burn_subs:
         debug["srt_path"] = srt_path
