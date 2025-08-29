@@ -43,7 +43,7 @@ def _gdrive_upload(file_path: str, file_name: str, folder_id: Optional[str], log
                               fields="id,webViewLink,webContentLink").execute()
     logger.info(f"[{req_id}] gdrive upload ok id={resp.get('id')} webViewLink={resp.get('webViewLink')}")
     return resp
-# --------------------------------------------------------------
+# ----------------------------------------------------
 
 def _ffprobe_duration(path: str) -> float:
     try:
@@ -59,34 +59,29 @@ def _ffprobe_duration(path: str) -> float:
 def _start():
     g.req_id = request.headers.get("X-Request-ID", str(uuid4()))
     g.t0 = time.time()
-    app.logger.info(f"[{g.req_id}] --> {request.method} {request.path} ct={request.content_type} len={request.content_length}")
 
 @app.after_request
 def _end(resp):
-    dt = (time.time()-g.t0)*1000
-    resp.headers["X-Request-ID"] = g.req_id
-    app.logger.info(f"[{g.req_id}] <-- {resp.status_code} {dt:.1f}ms")
+    try:
+        dt = (time.time() - g.t0)
+        app.logger.info(f"[{g.req_id}] {request.method} {request.path} -> {resp.status_code} in {dt:.3f}s")
+    except Exception:
+        pass
     return resp
 
-def _parse_int(v, d):
-    try: return int(v)
-    except: return d
+def _parse_int(s: Any, default: int) -> int:
+    try:
+        return int(s)
+    except Exception:
+        return default
 
 def _normalize_plan(raw: Any) -> List[Dict[str, Any]]:
-    """
-    Tolérante aux petits JSON cassés (ex: guillemet non terminé).
-    Accepte:
-      {"plan":[{...}, ...]}  ou directement  [{...}, ...]
-    """
-    if raw is None:
-        raise ValueError("Missing 'plan'")
     if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode("utf-8", "ignore")
+        raw = raw.decode("utf-8","ignore")
     if isinstance(raw, str):
-        raw = raw.strip()
-        # g.req_id est défini en contexte Flask (ou injecté par app.app_context() dans le worker)
         try:
-            app.logger.info(f"[{g.req_id}] plan_len={len(raw)} head={raw[:400].replace(chr(10),' ')}")
+            if LOG_LEVEL == "DEBUG":
+                app.logger.info(f"[{g.req_id}] plan_len={len(raw)} head={raw[:400].replace(chr(10),' ')}")
         except Exception:
             pass
         try:
@@ -123,6 +118,7 @@ def create_video():
         plan_str = request.form["plan"]
         audio_file = request.files["audio_file"]
         global_srt = request.form.get("global_srt")
+        burn_mode = request.form.get("burn_mode", os.getenv("BURN_MODE", "none"))
         drive_folder_id = request.form.get("drive_folder_id") or request.args.get("drive_folder_id")
 
         app.logger.info(f"[{g.req_id}] fields ok name={output_name} {width}x{height}@{fps} audio={getattr(audio_file,'filename',None)}")
@@ -145,10 +141,9 @@ def create_video():
         audio_path = os.path.join(workdir, "voice.mp3")
         audio_file.save(audio_path)
         audio_size = os.path.getsize(audio_path)
-        audio_dur = _ffprobe_duration(audio_path)
+        audio_dur  = _ffprobe_duration(audio_path)
         app.logger.info(f"[{g.req_id}] audio path={audio_path} size={audio_size}B dur={audio_dur:.3f}s")
 
-        # dump inputs pour post-mortem
         with open(os.path.join(debug_dir, "plan_input.json"), "w", encoding="utf-8") as f:
             json.dump({"plan": plan}, f, ensure_ascii=False, indent=2)
 
@@ -160,37 +155,31 @@ def create_video():
             width=width, height=height, fps=fps,
             logger=app.logger, req_id=g.req_id,
             global_srt=global_srt,
+            burn_subs=(burn_mode != "none"),
         )
 
         out_size = os.path.getsize(out_path)
         out_dur  = _ffprobe_duration(out_path)
         app.logger.info(f"[{g.req_id}] OUTPUT path={out_path} size={out_size}B dur={out_dur:.3f}s")
 
-        # bundle debug
-        with open(os.path.join(debug_dir, "generator_debug.json"), "w", encoding="utf-8") as f:
-            json.dump(gen_debug, f, ensure_ascii=False, indent=2)
-
-        resp_json = {
-            "status": "success",
-            "output_path": out_path,
-            "width": width, "height": height, "fps": fps,
-            "items": len(plan),
+        # bundle réponse (sans upload)
+        resp = {
+            "status":"success","output_path":out_path,
+            "width":width,"height":height,"fps":fps,"items":len(plan),
             "out_size": out_size, "out_duration": out_dur,
-            "workdir": workdir
+            "debug": gen_debug
         }
 
+        # upload optionnel
         if drive_folder_id:
             try:
                 gd = _gdrive_upload(out_path, output_name, drive_folder_id, app.logger, g.req_id)
-                resp_json.update({
-                    "drive_file_id": gd.get("id"),
-                    "drive_webViewLink": gd.get("webViewLink"),
-                })
+                resp.update({"drive_file_id": gd.get("id"), "drive_webViewLink": gd.get("webViewLink")})
             except Exception as e:
                 app.logger.exception(f"[{g.req_id}] drive upload failed: {e}")
-                resp_json["drive_error"] = str(e)
+                resp["drive_error"] = str(e)
 
-        return jsonify(resp_json)
+        return jsonify(resp)
 
     except Exception as e:
         app.logger.error(f"[{getattr(g,'req_id','?')}] create-video failed: {e}\n{traceback.format_exc()}")
@@ -222,8 +211,8 @@ def _post_callback(url: str, payload: Dict[str, Any]):
             req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
                                          headers={"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=10).read()
-    except Exception as e:
-        app.logger.warning(f"[{payload.get('req_id','?')}] callback failed: {e}")
+    except Exception:
+        pass
 
 def _worker_create_video(jid: str, fields: Dict[str, Any]):
     """Exécute la création vidéo hors requête HTTP (thread)."""
@@ -241,6 +230,7 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
             plan_str      = fields["plan"]
             audio_srcpath = fields["audio_path"]  # déjà sauvé par le endpoint
             global_srt    = fields.get("global_srt")
+            burn_mode     = fields.get("burn_mode", os.getenv("BURN_MODE", "none"))
             drive_folder_id = fields.get("drive_folder_id")
 
             app.logger.info(f"[{req_id}] (async) start job {jid} name={output_name} {width}x{height}@{fps}")
@@ -268,6 +258,8 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
             with open(os.path.join(debug_dir, "plan_input.json"), "w", encoding="utf-8") as f:
                 json.dump({"plan": plan}, f, ensure_ascii=False, indent=2)
 
+            _set_job(jid, status="running", stage="encoding", updated_at=int(time.time()))
+
             out_path, gen_debug = generate_video(
                 plan=plan,
                 audio_path=audio_path,
@@ -276,6 +268,7 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
                 width=width, height=height, fps=fps,
                 logger=app.logger, req_id=req_id,
                 global_srt=global_srt,
+                burn_subs=(burn_mode != "none"),
             )
 
             out_size = os.path.getsize(out_path)
@@ -315,13 +308,13 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
 
     except Exception as e:
         err = {"status": "error", "job_id": jid, "message": str(e), "req_id": req_id}
-        app.logger.error(f"[{req_id}] (async) job failed: {e}\n{traceback.format_exc()}")
         _set_job(jid, **err)
+        app.logger.error(f"[{req_id}] job error: {e}\n{traceback.format_exc()}")
         if callback_url:
-            _post_callback(callback_url, {"job_id": jid, **err})
+            try: _post_callback(callback_url, {"job_id": jid, **err})
+            except Exception: pass
     finally:
         try:
-            # Nettoyage : on garde par défaut (KEEP_TMP=1). Si tu veux purger, passe KEEP_TMP=0 et CLEAN_TMP=1.
             if not KEEP_TMP and os.getenv("CLEAN_TMP") == "1" and workdir and os.path.isdir(workdir):
                 shutil.rmtree(workdir, ignore_errors=True)
         except Exception:
@@ -329,17 +322,7 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
 
 @app.post("/create-video-async")
 def create_video_async():
-    """
-    Reçoit la même payload que /create-video mais NE BLOQUE PAS.
-    Retourne immédiatement {job_id, status: queued}.
-    Champs acceptés:
-      - output_name, width, height, fps
-      - plan (JSON ou string)
-      - audio_file (multipart)
-      - global_srt (optionnel), drive_folder_id (optionnel)
-      - callback_url (optionnel) : URL appelée en POST JSON quand le job termine
-    """
-    # Préparation rapide des assets pour le worker
+    """Enqueue du job + sauvegarde rapide des assets pour le worker"""
     jid = request.form.get("job_id") or str(uuid4())
     req_id = request.headers.get("X-Request-ID", str(uuid4()))
     tmp = tempfile.mkdtemp(prefix=f"enqueue_{jid}_")
@@ -358,6 +341,7 @@ def create_video_async():
             "plan": request.form["plan"],
             "audio_path": audio_local,
             "global_srt": request.form.get("global_srt"),
+            "burn_mode": request.form.get("burn_mode", os.getenv("BURN_MODE", "none")),
             "drive_folder_id": request.form.get("drive_folder_id") or request.args.get("drive_folder_id"),
             "callback_url": request.form.get("callback_url"),
         }
