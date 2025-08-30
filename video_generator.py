@@ -1,4 +1,4 @@
-# video_generator.py — encode segments + burn SRT PAR SEGMENT (style CapCut) + concat copy + mux audio
+# video_generator.py — encode segments + burn SRT PAR SEGMENT (style CapCut) + concat copy + mux audio (+ musique BG optionnelle)
 import os, time, shutil, subprocess, logging, urllib.request, json, shlex
 from typing import Any, Dict, List, Tuple
 from utils.text_overlay import make_segment_srt, SUB_STYLE_CAPCUT
@@ -111,6 +111,26 @@ def _mux_audio(video_path: str, audio_path: str, out_path: str, logger: logging.
            f"{shlex.quote(out_path)}")
     _run(cmd, logger, req_id)
 
+def _mix_voice_with_music(voice_path: str, music_path: str, delay_sec: int,
+                          out_audio_path: str, logger: logging.Logger, req_id: str,
+                          music_volume: float = 0.25):
+    """
+    Mixe la voix + musique BG (avec délai et volume).
+    Durée = voix (amix:duration=first), pour coller au montage.
+    """
+    delay_ms = max(0, int(delay_sec * 1000))
+    # adelay a besoin d'une valeur par canal -> "ms|ms"
+    adl = f"{delay_ms}|{delay_ms}"
+    cmd = (
+        "ffmpeg -y -hide_banner -loglevel error "
+        f"-i {shlex.quote(voice_path)} -i {shlex.quote(music_path)} "
+        f"-filter_complex \"[1:a]adelay={adl},volume={music_volume}[bg];"
+        "[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[a]\" "
+        "-map \"[a]\" -c:a aac -b:a 192k "
+        f"{shlex.quote(out_audio_path)}"
+    )
+    _run(cmd, logger, req_id)
+
 def generate_video(
     plan: List[Dict[str, Any]],
     audio_path: str,
@@ -125,6 +145,10 @@ def generate_video(
     # nouveaux params tolérés par main.py / Make
     global_srt: str = None,
     burn_mode: str = None,
+    # musique BG optionnelle
+    music_path: str = None,
+    music_delay: int = 0,
+    music_volume: float = 0.25,
     **kwargs
 ):
     """
@@ -132,8 +156,11 @@ def generate_video(
       - "segment" (défaut si None) : burn des sous-titres par segment (style CapCut)
       - "none"                     : pas de sous-titres gravés
     global_srt est ignoré ici (on suit le plan segmenté).
+
+    music_path : chemin local MP3 à mixer
+    music_delay: décalage d'entrée de la musique (sec), détecté via nom "xxx@55.mp3"
+    music_volume: volume relatif de la musique (0.0-1.0)
     """
-    # normalisation du mode
     mode_burn = (burn_mode or "segment").lower().strip()
     burn_segments = (mode_burn != "none")
 
@@ -185,13 +212,23 @@ def generate_video(
     video_only = os.path.join(temp_dir, "_video.mp4")
     concat_mode = _concat_copy_strict(parts, video_only, logger, req_id)
 
+    # prépare l'audio final (voix ou voix+musique)
+    audio_for_mux = audio_path
+    if music_path:
+        mixed = os.path.join(temp_dir, "voice_mix.mp3")
+        _mix_voice_with_music(audio_path, music_path, int(music_delay), mixed, logger, req_id, music_volume=music_volume)
+        audio_for_mux = mixed
+
     out_path = os.path.join(temp_dir, output_name)
-    _mux_audio(video_only, audio_path, out_path, logger, req_id)
+    _mux_audio(video_only, audio_for_mux, out_path, logger, req_id)
 
     debug = {
         "mode": concat_mode,
         "subs": ("burned_per_segment" if has_seg_times else ("none" if not burn_segments else "no_times")),
         "items": len(parts),
         "burn_mode": mode_burn,
+        "music": bool(music_path),
+        "music_delay": int(music_delay) if music_path else 0,
+        "music_volume": float(music_volume) if music_path else 0.0,
     }
     return out_path, debug
