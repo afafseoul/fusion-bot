@@ -200,7 +200,7 @@ def generate_video(
         # encode uniforme (+ burn segment éventuel)
         part_path = os.path.join(temp_dir, f"part_{i:03d}.mp4")
         _encode_uniform(src_for_encode, part_path, width, height, fps, dur, logger, req_id,
-                        subs_path=seg_srt, sub_style=sub_style)
+                        subs_path=seg_srt, sub_style=DEFAULT_SUB_STYLE)
         parts.append(part_path)
         if seg.get("start_time") is None:
             t_running += dur
