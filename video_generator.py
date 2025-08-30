@@ -49,7 +49,7 @@ def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> 
     if dst.endswith(".bin"):
         head = open(dst, "rb").read(512).lower()
         if b"<html" in head or b"<!doctype html" in head:
-            raise RuntimeError("Downloaded file is not media (got HTML). Rends l’URL Drive publique directe (uc?export=download ou drive.usercontent...).")
+            raise RuntimeError("Downloaded file is not media (got HTML). Lien Drive direct requis.")
     logger.info(f"[{req_id}] download ok -> {dst}")
     return dst
 
@@ -119,8 +119,7 @@ def _mix_voice_with_music(voice_path: str, music_path: str, delay_sec: int,
     Durée = voix (amix:duration=first), pour coller au montage.
     """
     delay_ms = max(0, int(delay_sec * 1000))
-    # adelay a besoin d'une valeur par canal -> "ms|ms"
-    adl = f"{delay_ms}|{delay_ms}"
+    adl = f"{delay_ms}|{delay_ms}"  # adelay a besoin d'une valeur par canal
     cmd = (
         "ffmpeg -y -hide_banner -loglevel error "
         f"-i {shlex.quote(voice_path)} -i {shlex.quote(music_path)} "
@@ -142,7 +141,7 @@ def generate_video(
     logger: logging.Logger,
     req_id: str,
     sub_style: str = DEFAULT_SUB_STYLE,
-    # nouveaux params tolérés par main.py / Make
+    # paramètres tolérés en entrée
     global_srt: str = None,
     burn_mode: str = None,
     # musique BG optionnelle
@@ -153,13 +152,12 @@ def generate_video(
 ):
     """
     burn_mode:
-      - "segment" (défaut si None) : burn des sous-titres par segment (style CapCut)
-      - "none"                     : pas de sous-titres gravés
-    global_srt est ignoré ici (on suit le plan segmenté).
+      - "segment" (défaut) : sous-titres par segment (style CapCut)
+      - "none"             : pas de sous-titres gravés
 
-    music_path : chemin local MP3 à mixer
-    music_delay: décalage d'entrée de la musique (sec), détecté via nom "xxx@55.mp3"
-    music_volume: volume relatif de la musique (0.0-1.0)
+    music_path : chemin local MP3 à mixer (aléatoire via Drive)
+    music_delay: décalage (secondes) détecté via nom "xxx@55.mp3"
+    music_volume: volume relatif musique (0.0-1.0)
     """
     mode_burn = (burn_mode or "segment").lower().strip()
     burn_segments = (mode_burn != "none")
@@ -170,7 +168,8 @@ def generate_video(
 
     for i, seg in enumerate(plan):
         url = seg.get("gif_url") or seg.get("url") or seg.get("video_url")
-        if not url: raise ValueError(f"plan[{i}] missing url/gif_url")
+        if not url:
+            raise ValueError(f"plan[{i}] missing url/gif_url")
         try:
             dur = float(seg.get("duration") or 0.0)
         except Exception:
@@ -191,16 +190,16 @@ def generate_video(
             if not (has_video or is_gif):
                 raise RuntimeError("Downloaded file is not media (got HTML). Lien Drive direct requis.")
 
-        # SRT segment (si le plan fournit des fenêtres && burn actif)
+        # SRT segment (si fenêtres && burn actif)
         seg_srt = None
         if has_seg_times:
             seg_srt = os.path.join(temp_dir, f"seg_{i:03d}.srt")
             make_segment_srt(seg.get("subtitles"), txt, start, dur, seg_srt)
 
-        # encode uniforme (+ burn segment éventuel)
+        # encode uniforme (+ burn éventuel)
         part_path = os.path.join(temp_dir, f"part_{i:03d}.mp4")
         _encode_uniform(src_for_encode, part_path, width, height, fps, dur, logger, req_id,
-                        subs_path=seg_srt, sub_style=DEFAULT_SUB_STYLE)
+                        subs_path=seg_srt, sub_style=sub_style)
         parts.append(part_path)
         if seg.get("start_time") is None:
             t_running += dur
@@ -208,7 +207,7 @@ def generate_video(
     if not parts:
         raise ValueError("empty parts")
 
-    # concat (copy) -> mux audio (copy vidéo)
+    # concat (copy) -> mux audio
     video_only = os.path.join(temp_dir, "_video.mp4")
     concat_mode = _concat_copy_strict(parts, video_only, logger, req_id)
 
