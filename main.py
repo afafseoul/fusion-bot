@@ -1,5 +1,5 @@
 # main.py — API sync + async (jobs) pour création vidéo
-import os, json, time, tempfile, logging, shutil, subprocess, traceback, random, io, re
+import os, json, time, tempfile, logging, shutil, subprocess, traceback, random, re
 from uuid import uuid4
 from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, request, jsonify, g
@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify, g
 from threading import Thread, Lock
 try:
     import requests as _requests  # pour le callback
-except Exception:  # requests non présent ? on dégradera plus bas
+except Exception:
     _requests = None
 import urllib.request, urllib.error
 
@@ -20,7 +20,7 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 # ---------------------------------------------------------------
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-KEEP_TMP  = os.getenv("KEEP_TMP", "1") == "1"   # on garde par défaut pour debug
+KEEP_TMP  = os.getenv("KEEP_TMP", "1") == "1"   # garder /tmp par défaut
 
 app = Flask(__name__)
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
@@ -28,8 +28,16 @@ app.logger.setLevel(logging.getLogger().level)
 
 # -------------------- Google Drive helpers --------------------
 def _gdrive_service():
+    """
+    IMPORTANT: scope 'drive' (ou 'drive.readonly') pour lister les fichiers
+    PARTAGÉS au service account. 'drive.file' ne suffit pas.
+    """
     path = os.getenv("GOOGLE_CREDS", "/etc/secrets/credentials.json")
-    scopes = ["https://www.googleapis.com/auth/drive.file"]
+    scopes = [
+        "https://www.googleapis.com/auth/drive",  # plein accès (upload + list + download)
+        # si tu veux limiter en lecture seule, remplace par:
+        # "https://www.googleapis.com/auth/drive.readonly",
+    ]
     creds = Credentials.from_service_account_file(path, scopes=scopes)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
@@ -40,69 +48,65 @@ def _gdrive_upload(file_path: str, file_name: str, folder_id: Optional[str], log
         meta["parents"] = [folder_id]
     media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=False)
     resp = svc.files().create(body=meta, media_body=media,
-                              fields="id,webViewLink,webContentLink").execute()
+                              fields="id,webViewLink,webContentLink",
+                              supportsAllDrives=True).execute()
     logger.info(f"[{req_id}] gdrive upload ok id={resp.get('id')} webViewLink={resp.get('webViewLink')}")
     return resp
 
-# --- Music (Drive) ---
-_AUDIO_EXTS = [".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"]
-
-def _gdrive_list_music_files(svc, folder_id: str) -> List[Dict[str, str]]:
-    """
-    Robuste : accepte les vrais mimetypes audio ET les fichiers
-    dont le nom contient une extension audio (mp3, wav, etc).
-    """
-    name_or = " or ".join([f"name contains '{ext}'" for ext in _AUDIO_EXTS])
-    q = f"'{folder_id}' in parents and trashed=false and ((mimeType contains 'audio') or ({name_or}))"
-    out = []
-    page_token = None
-    while True:
-        resp = svc.files().list(
-            q=q, spaces="drive",
-            fields="nextPageToken, files(id,name,mimeType,size)",
-            pageToken=page_token
-        ).execute()
-        out.extend(resp.get("files", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    return out
-
 def _gdrive_pick_and_download_music(folder_id: str, workdir: str, logger, req_id: str) -> Tuple[Optional[str], int]:
     """
-    Choisit un fichier audio aléatoire et le télécharge dans workdir.
-    Retourne (local_path, delay_sec). delay_sec détecté via suffixe '@NN' avant l'extension.
+    Choisit un fichier audio aléatoire dans un dossier Drive et le télécharge.
+    Retourne (chemin_local, delay_sec). Le délai est détecté via un suffixe @NN
+    juste avant l’extension (ex: 'MaZic@55.mp3' -> delay_sec=55).
     """
     try:
         svc = _gdrive_service()
-        files = _gdrive_list_music_files(svc, folder_id)
+
+        # Requête plus large: audio/* ou extension mp3/wav/m4a
+        q = (
+            f"'{folder_id}' in parents and trashed=false and "
+            f"(mimeType contains 'audio' or name contains '.mp3' or name contains '.wav' or name contains '.m4a')"
+        )
+
+        files: List[Dict[str, str]] = []
+        page_token = None
+        while True:
+            resp = svc.files().list(
+                q=q, spaces="drive",
+                fields="nextPageToken, files(id,name,mimeType,size)",
+                pageToken=page_token,
+                includeItemsFromAllDrives=True, supportsAllDrives=True
+            ).execute()
+            files.extend(resp.get("files", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
         if not files:
             logger.warning(f"[{req_id}] ⚠️ aucun fichier audio trouvé dans le dossier {folder_id}")
             return None, 0
 
         pick = random.choice(files)
-        fid, fname = pick.get("id"), pick.get("name") or "music"
-        # garder l'extension (utile pour ffmpeg)
-        ext = os.path.splitext(fname)[1] or ".mp3"
-        local = os.path.join(workdir, f"music{ext}")
+        fid, fname = pick["id"], pick["name"]
+        local = os.path.join(workdir, f"music_{fname}")
+        logger.info(f"[{req_id}] musique choisie: {fname} (id={fid})")
 
-        logger.info(f"[{req_id}] 🎵 musique choisie: {fname} (id={fid})")
-        req = svc.files().get_media(fileId=fid)
+        req = svc.files().get_media(fileId=fid, supportsAllDrives=True)
         with open(local, "wb") as fh:
             downloader = MediaIoBaseDownload(fh, req)
             done = False
             while not done:
                 _status, done = downloader.next_chunk()
 
-        # extrait un éventuel @NN avant l’extension -> délai en secondes
+        # extrait un éventuel @NN avant l'extension -> seconds
         delay_sec = 0
         m = re.search(r"@(\d+)(?=\.[^.]+$)", fname)
         if m:
-            try: delay_sec = int(m.group(1))
-            except Exception: delay_sec = 0
+            try:
+                delay_sec = int(m.group(1))
+            except Exception:
+                delay_sec = 0
 
-        size = os.path.getsize(local)
-        logger.info(f"[{req_id}] musique DL ok -> {local} size={size} delay={delay_sec}s")
         return local, delay_sec
     except Exception as e:
         logger.exception(f"[{req_id}] erreur download musique: {e}")
@@ -170,9 +174,8 @@ def _normalize_plan(raw: Any) -> List[Dict[str, Any]]:
         raise ValueError("plan is empty")
     return raw
 
-# Une seule route GET pour "wake/health"
 @app.get("/")
-def health():
+def root():
     return jsonify(ok=True, service="fusion-bot", ts=int(time.time()))
 
 # =========================
@@ -187,7 +190,6 @@ def create_video():
         height = _parse_int(request.form.get("height", 1920), 1920)
         fps    = _parse_int(request.form.get("fps", 30), 30)
         plan_str = request.form["plan"]
-
         audio_file = request.files["audio_file"]
         global_srt = request.form.get("global_srt")
         burn_mode  = request.form.get("burn_mode", os.getenv("BURN_MODE", "segment"))
@@ -226,6 +228,8 @@ def create_video():
         music_path, music_delay = (None, 0)
         if music_folder_id:
             music_path, music_delay = _gdrive_pick_and_download_music(music_folder_id, workdir, app.logger, g.req_id)
+            if music_path:
+                app.logger.info(f"[{g.req_id}] musique DL ok -> {music_path} delay={music_delay}s vol={music_volume}")
 
         with open(os.path.join(debug_dir, "plan_input.json"), "w", encoding="utf-8") as f:
             json.dump({"plan": plan}, f, ensure_ascii=False, indent=2)
@@ -345,10 +349,12 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
             audio_dur  = _ffprobe_duration(audio_path)
             app.logger.info(f"[{req_id}] audio path={audio_path} size={audio_size}B dur={audio_dur:.3f}s")
 
-            # musique BG (si dossier fourni)
+            # musique BG
             music_path, music_delay = (None, 0)
             if music_folder_id:
                 music_path, music_delay = _gdrive_pick_and_download_music(music_folder_id, workdir, app.logger, req_id)
+                if music_path:
+                    app.logger.info(f"[{req_id}] musique DL ok -> {music_path} delay={music_delay}s vol={music_volume}")
 
             with open(os.path.join(debug_dir, "plan_input.json"), "w", encoding="utf-8") as f:
                 json.dump({"plan": plan}, f, ensure_ascii=False, indent=2)
@@ -474,6 +480,8 @@ def list_jobs():
             for j in JOBS.values()
         ]
     return jsonify(items)
+
+# =========================
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
