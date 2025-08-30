@@ -1,7 +1,7 @@
 # main.py — API sync + async (jobs) pour création vidéo
-import os, json, time, tempfile, logging, shutil, subprocess, traceback
+import os, json, time, tempfile, logging, shutil, subprocess, traceback, random, io, re
 from uuid import uuid4
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, request, jsonify, g
 
 from threading import Thread, Lock
@@ -16,7 +16,7 @@ from video_generator import generate_video
 # --- Google Drive (clé dans Secret Files : credentials.json) ---
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 # ---------------------------------------------------------------
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -43,6 +43,56 @@ def _gdrive_upload(file_path: str, file_name: str, folder_id: Optional[str], log
                               fields="id,webViewLink,webContentLink").execute()
     logger.info(f"[{req_id}] gdrive upload ok id={resp.get('id')} webViewLink={resp.get('webViewLink')}")
     return resp
+
+def _gdrive_pick_and_download_music(folder_id: str, workdir: str, logger, req_id: str) -> Tuple[Optional[str], int]:
+    """
+    Choisit un MP3 (ou audio) aléatoire dans un dossier Drive et le télécharge.
+    Retourne (chemin_local, delay_sec) ; delay_sec détecté via suffixe @NN dans le nom du fichier.
+    """
+    try:
+        svc = _gdrive_service()
+        q = f"'{folder_id}' in parents and mimeType contains 'audio' and trashed=false"
+        files: List[Dict[str, str]] = []
+        page_token = None
+        while True:
+            resp = svc.files().list(
+                q=q, spaces="drive",
+                fields="nextPageToken, files(id,name,mimeType)", pageToken=page_token
+            ).execute()
+            files.extend(resp.get("files", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+        if not files:
+            logger.warning(f"[{req_id}] aucun fichier audio trouvé dans le dossier {folder_id}")
+            return None, 0
+
+        pick = random.choice(files)
+        fid, fname = pick["id"], pick["name"]
+        local = os.path.join(workdir, f"music_{fname}")
+        logger.info(f"[{req_id}] musique choisie: {fname} (id={fid})")
+
+        req = svc.files().get_media(fileId=fid)
+        with open(local, "wb") as fh:
+            downloader = MediaIoBaseDownload(fh, req)
+            done = False
+            while not done:
+                _status, done = downloader.next_chunk()
+
+        # extrait un éventuel @NN avant l'extension -> délai en secondes
+        delay_sec = 0
+        m = re.search(r"@(\d+)(?=\.[^.]+$)", fname)
+        if m:
+            try:
+                delay_sec = int(m.group(1))
+            except Exception:
+                delay_sec = 0
+
+        return local, delay_sec
+    except Exception as e:
+        logger.exception(f"[{req_id}] erreur download musique: {e}")
+        return None, 0
 # ----------------------------------------------------
 
 def _ffprobe_duration(path: str) -> float:
@@ -72,6 +122,12 @@ def _end(resp):
 def _parse_int(s: Any, default: int) -> int:
     try:
         return int(s)
+    except Exception:
+        return default
+
+def _parse_float(s: Any, default: float) -> float:
+    try:
+        return float(s)
     except Exception:
         return default
 
@@ -126,6 +182,10 @@ def create_video():
         burn_flag  = str(request.form.get("burn_subs", "1")).lower().strip()
         burn_active = burn_flag not in ("0", "false", "no", "none", "")
 
+        # musique optionnelle
+        music_folder_id = request.form.get("music_folder_id")
+        music_volume    = _parse_float(request.form.get("music_volume", 0.25), 0.25)
+
         drive_folder_id = request.form.get("drive_folder_id") or request.args.get("drive_folder_id")
 
         app.logger.info(f"[{g.req_id}] fields ok name={output_name} {width}x{height}@{fps} audio={getattr(audio_file,'filename',None)}")
@@ -143,12 +203,19 @@ def create_video():
         debug_dir = os.path.join(workdir, "debug")
         os.makedirs(debug_dir, exist_ok=True)
 
-        # audio
+        # audio voix
         audio_path = os.path.join(workdir, "voice.mp3")
         audio_file.save(audio_path)
         audio_size = os.path.getsize(audio_path)
         audio_dur  = _ffprobe_duration(audio_path)
         app.logger.info(f"[{g.req_id}] audio path={audio_path} size={audio_size}B dur={audio_dur:.3f}s")
+
+        # musique BG (si dossier fourni)
+        music_path, music_delay = (None, 0)
+        if music_folder_id:
+            music_path, music_delay = _gdrive_pick_and_download_music(music_folder_id, workdir, app.logger, g.req_id)
+            if music_path:
+                app.logger.info(f"[{g.req_id}] musique DL ok -> {music_path} delay={music_delay}s vol={music_volume}")
 
         with open(os.path.join(debug_dir, "plan_input.json"), "w", encoding="utf-8") as f:
             json.dump({"plan": plan}, f, ensure_ascii=False, indent=2)
@@ -162,6 +229,10 @@ def create_video():
             logger=app.logger, req_id=g.req_id,
             global_srt=global_srt,
             burn_mode=("none" if not burn_active else burn_mode),
+            # musique
+            music_path=music_path,
+            music_delay=music_delay,
+            music_volume=music_volume,
         )
 
         out_size = os.path.getsize(out_path)
@@ -238,6 +309,10 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
 
             drive_folder_id = fields.get("drive_folder_id")
 
+            # musique
+            music_folder_id = fields.get("music_folder_id")
+            music_volume    = _parse_float(fields.get("music_volume", 0.25), 0.25)
+
             app.logger.info(f"[{req_id}] (async) start job {jid} name={output_name} {width}x{height}@{fps}")
 
             plan = _normalize_plan(plan_str)
@@ -253,11 +328,19 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
             debug_dir = os.path.join(workdir, "debug")
             os.makedirs(debug_dir, exist_ok=True)
 
+            # voix
             audio_path = os.path.join(workdir, "voice.mp3")
             shutil.copy2(audio_srcpath, audio_path)
             audio_size = os.path.getsize(audio_path)
             audio_dur  = _ffprobe_duration(audio_path)
             app.logger.info(f"[{req_id}] audio path={audio_path} size={audio_size}B dur={audio_dur:.3f}s")
+
+            # musique BG (si dossier fourni)
+            music_path, music_delay = (None, 0)
+            if music_folder_id:
+                music_path, music_delay = _gdrive_pick_and_download_music(music_folder_id, workdir, app.logger, req_id)
+                if music_path:
+                    app.logger.info(f"[{req_id}] musique DL ok -> {music_path} delay={music_delay}s vol={music_volume}")
 
             with open(os.path.join(debug_dir, "plan_input.json"), "w", encoding="utf-8") as f:
                 json.dump({"plan": plan}, f, ensure_ascii=False, indent=2)
@@ -273,6 +356,10 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
                 logger=app.logger, req_id=req_id,
                 global_srt=global_srt,
                 burn_mode=("none" if not burn_active else burn_mode),
+                # musique
+                music_path=music_path,
+                music_delay=music_delay,
+                music_volume=music_volume,
             )
 
             out_size = os.path.getsize(out_path)
@@ -347,6 +434,9 @@ def create_video_async():
             "burn_subs": request.form.get("burn_subs", "1"),
             "drive_folder_id": request.form.get("drive_folder_id") or request.args.get("drive_folder_id"),
             "callback_url": request.form.get("callback_url"),
+            # musique
+            "music_folder_id": request.form.get("music_folder_id"),
+            "music_volume": request.form.get("music_volume"),
         }
 
         _set_job(jid, status="queued", job_id=jid, req_id=req_id, enqueued_at=int(time.time()))
