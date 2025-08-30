@@ -122,14 +122,16 @@ def create_video():
         plan_str = request.form["plan"]
         audio_file = request.files["audio_file"]
         global_srt = request.form.get("global_srt")
-        burn_mode = request.form.get("burn_mode", os.getenv("BURN_MODE", "none"))
+        burn_mode  = request.form.get("burn_mode", os.getenv("BURN_MODE", "segment"))
+        burn_flag  = str(request.form.get("burn_subs", "1")).lower().strip()
+        burn_active = burn_flag not in ("0", "false", "no", "none", "")
+
         drive_folder_id = request.form.get("drive_folder_id") or request.args.get("drive_folder_id")
 
         app.logger.info(f"[{g.req_id}] fields ok name={output_name} {width}x{height}@{fps} audio={getattr(audio_file,'filename',None)}")
 
         plan = _normalize_plan(plan_str)
 
-        # indicatif disque
         try:
             total_dur = sum(float(max(0.0, (seg.get("duration") or 0))) for seg in plan)
         except Exception:
@@ -159,14 +161,13 @@ def create_video():
             width=width, height=height, fps=fps,
             logger=app.logger, req_id=g.req_id,
             global_srt=global_srt,
-            burn_subs=(burn_mode != "none"),
+            burn_mode=("none" if not burn_active else burn_mode),
         )
 
         out_size = os.path.getsize(out_path)
         out_dur  = _ffprobe_duration(out_path)
         app.logger.info(f"[{g.req_id}] OUTPUT path={out_path} size={out_size}B dur={out_dur:.3f}s")
 
-        # bundle réponse (sans upload)
         resp = {
             "status":"success","output_path":out_path,
             "width":width,"height":height,"fps":fps,"items":len(plan),
@@ -174,7 +175,6 @@ def create_video():
             "debug": gen_debug
         }
 
-        # upload optionnel
         if drive_folder_id:
             try:
                 gd = _gdrive_upload(out_path, output_name, drive_folder_id, app.logger, g.req_id)
@@ -199,7 +199,6 @@ def create_video():
 #        ASYNC API
 # =========================
 
-# Mémoire très simple en RAM pour le suivi des jobs
 JOBS: Dict[str, Dict[str, Any]] = {}
 JLOCK = Lock()
 
@@ -219,7 +218,6 @@ def _post_callback(url: str, payload: Dict[str, Any]):
         pass
 
 def _worker_create_video(jid: str, fields: Dict[str, Any]):
-    """Exécute la création vidéo hors requête HTTP (thread)."""
     workdir = None
     req_id = fields.get("req_id", jid)
     callback_url = fields.get("callback_url")
@@ -232,9 +230,12 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
             height        = _parse_int(fields.get("height", 1920), 1920)
             fps           = _parse_int(fields.get("fps", 30), 30)
             plan_str      = fields["plan"]
-            audio_srcpath = fields["audio_path"]  # déjà sauvé par le endpoint
+            audio_srcpath = fields["audio_path"]
             global_srt    = fields.get("global_srt")
-            burn_mode     = fields.get("burn_mode", os.getenv("BURN_MODE", "none"))
+            burn_mode     = fields.get("burn_mode", os.getenv("BURN_MODE", "segment"))
+            burn_flag     = str(fields.get("burn_subs", "1")).lower().strip()
+            burn_active   = burn_flag not in ("0", "false", "no", "none", "")
+
             drive_folder_id = fields.get("drive_folder_id")
 
             app.logger.info(f"[{req_id}] (async) start job {jid} name={output_name} {width}x{height}@{fps}")
@@ -252,7 +253,6 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
             debug_dir = os.path.join(workdir, "debug")
             os.makedirs(debug_dir, exist_ok=True)
 
-            # copie/rename audio dans le workdir pour uniformiser avec logique sync
             audio_path = os.path.join(workdir, "voice.mp3")
             shutil.copy2(audio_srcpath, audio_path)
             audio_size = os.path.getsize(audio_path)
@@ -272,7 +272,7 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
                 width=width, height=height, fps=fps,
                 logger=app.logger, req_id=req_id,
                 global_srt=global_srt,
-                burn_subs=(burn_mode != "none"),
+                burn_mode=("none" if not burn_active else burn_mode),
             )
 
             out_size = os.path.getsize(out_path)
@@ -293,7 +293,6 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
                 "req_id": req_id,
             }
 
-            # Upload Drive si demandé
             if drive_folder_id:
                 try:
                     gd = _gdrive_upload(out_path, output_name, drive_folder_id, app.logger, req_id)
@@ -326,7 +325,6 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
 
 @app.post("/create-video-async")
 def create_video_async():
-    """Enqueue du job + sauvegarde rapide des assets pour le worker"""
     jid = request.form.get("job_id") or str(uuid4())
     req_id = request.headers.get("X-Request-ID", str(uuid4()))
     tmp = tempfile.mkdtemp(prefix=f"enqueue_{jid}_")
@@ -345,7 +343,8 @@ def create_video_async():
             "plan": request.form["plan"],
             "audio_path": audio_local,
             "global_srt": request.form.get("global_srt"),
-            "burn_mode": request.form.get("burn_mode", os.getenv("BURN_MODE", "none")),
+            "burn_mode": request.form.get("burn_mode", os.getenv("BURN_MODE", "segment")),
+            "burn_subs": request.form.get("burn_subs", "1"),
             "drive_folder_id": request.form.get("drive_folder_id") or request.args.get("drive_folder_id"),
             "callback_url": request.form.get("callback_url"),
         }
@@ -357,7 +356,6 @@ def create_video_async():
         return jsonify({"status": "queued", "job_id": jid}), 202
 
     except Exception as e:
-        # si l’enqueue échoue
         shutil.rmtree(tmp, ignore_errors=True)
         app.logger.error(f"[{req_id}] enqueue failed: {e}\n{traceback.format_exc()}")
         return jsonify(error="enqueue_failed", detail=str(e)), 400
@@ -373,14 +371,11 @@ def get_job(job_id: str):
 @app.get("/jobs")
 def list_jobs():
     with JLOCK:
-        # renvoie un snapshot minimal
         items = [
             {k: v for k, v in j.items() if k in ("job_id","status","req_id","enqueued_at")}
             for j in JOBS.values()
         ]
     return jsonify(items)
-
-# =========================
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
