@@ -44,35 +44,49 @@ def _gdrive_upload(file_path: str, file_name: str, folder_id: Optional[str], log
     logger.info(f"[{req_id}] gdrive upload ok id={resp.get('id')} webViewLink={resp.get('webViewLink')}")
     return resp
 
+# --- Music (Drive) ---
+_AUDIO_EXTS = [".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"]
+
+def _gdrive_list_music_files(svc, folder_id: str) -> List[Dict[str, str]]:
+    """
+    Robuste : accepte les vrais mimetypes audio ET les fichiers
+    dont le nom contient une extension audio (mp3, wav, etc).
+    """
+    name_or = " or ".join([f"name contains '{ext}'" for ext in _AUDIO_EXTS])
+    q = f"'{folder_id}' in parents and trashed=false and ((mimeType contains 'audio') or ({name_or}))"
+    out = []
+    page_token = None
+    while True:
+        resp = svc.files().list(
+            q=q, spaces="drive",
+            fields="nextPageToken, files(id,name,mimeType,size)",
+            pageToken=page_token
+        ).execute()
+        out.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return out
+
 def _gdrive_pick_and_download_music(folder_id: str, workdir: str, logger, req_id: str) -> Tuple[Optional[str], int]:
     """
-    Choisit un MP3 (ou audio) aléatoire dans un dossier Drive et le télécharge.
-    Retourne (chemin_local, delay_sec) ; delay_sec détecté via suffixe @NN dans le nom du fichier.
+    Choisit un fichier audio aléatoire et le télécharge dans workdir.
+    Retourne (local_path, delay_sec). delay_sec détecté via suffixe '@NN' avant l'extension.
     """
     try:
         svc = _gdrive_service()
-        q = f"'{folder_id}' in parents and mimeType contains 'audio' and trashed=false"
-        files: List[Dict[str, str]] = []
-        page_token = None
-        while True:
-            resp = svc.files().list(
-                q=q, spaces="drive",
-                fields="nextPageToken, files(id,name,mimeType)", pageToken=page_token
-            ).execute()
-            files.extend(resp.get("files", []))
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
-
+        files = _gdrive_list_music_files(svc, folder_id)
         if not files:
-            logger.warning(f"[{req_id}] aucun fichier audio trouvé dans le dossier {folder_id}")
+            logger.warning(f"[{req_id}] ⚠️ aucun fichier audio trouvé dans le dossier {folder_id}")
             return None, 0
 
         pick = random.choice(files)
-        fid, fname = pick["id"], pick["name"]
-        local = os.path.join(workdir, f"music_{fname}")
-        logger.info(f"[{req_id}] musique choisie: {fname} (id={fid})")
+        fid, fname = pick.get("id"), pick.get("name") or "music"
+        # garder l'extension (utile pour ffmpeg)
+        ext = os.path.splitext(fname)[1] or ".mp3"
+        local = os.path.join(workdir, f"music{ext}")
 
+        logger.info(f"[{req_id}] 🎵 musique choisie: {fname} (id={fid})")
         req = svc.files().get_media(fileId=fid)
         with open(local, "wb") as fh:
             downloader = MediaIoBaseDownload(fh, req)
@@ -80,15 +94,15 @@ def _gdrive_pick_and_download_music(folder_id: str, workdir: str, logger, req_id
             while not done:
                 _status, done = downloader.next_chunk()
 
-        # extrait un éventuel @NN avant l'extension -> délai en secondes
+        # extrait un éventuel @NN avant l’extension -> délai en secondes
         delay_sec = 0
         m = re.search(r"@(\d+)(?=\.[^.]+$)", fname)
         if m:
-            try:
-                delay_sec = int(m.group(1))
-            except Exception:
-                delay_sec = 0
+            try: delay_sec = int(m.group(1))
+            except Exception: delay_sec = 0
 
+        size = os.path.getsize(local)
+        logger.info(f"[{req_id}] musique DL ok -> {local} size={size} delay={delay_sec}s")
         return local, delay_sec
     except Exception as e:
         logger.exception(f"[{req_id}] erreur download musique: {e}")
@@ -156,17 +170,14 @@ def _normalize_plan(raw: Any) -> List[Dict[str, Any]]:
         raise ValueError("plan is empty")
     return raw
 
+# Une seule route GET pour "wake/health"
 @app.get("/")
-def root():
-    return {"status": "ok", "service": "fusion-bot"}, 200
+def health():
+    return jsonify(ok=True, service="fusion-bot", ts=int(time.time()))
 
 # =========================
 #         SYNC API
 # =========================
-@app.get("/")
-def health():
-    return jsonify(ok=True, ts=int(time.time()))
-
 @app.post("/create-video")
 def create_video():
     workdir = None
@@ -176,6 +187,7 @@ def create_video():
         height = _parse_int(request.form.get("height", 1920), 1920)
         fps    = _parse_int(request.form.get("fps", 30), 30)
         plan_str = request.form["plan"]
+
         audio_file = request.files["audio_file"]
         global_srt = request.form.get("global_srt")
         burn_mode  = request.form.get("burn_mode", os.getenv("BURN_MODE", "segment"))
@@ -214,8 +226,6 @@ def create_video():
         music_path, music_delay = (None, 0)
         if music_folder_id:
             music_path, music_delay = _gdrive_pick_and_download_music(music_folder_id, workdir, app.logger, g.req_id)
-            if music_path:
-                app.logger.info(f"[{g.req_id}] musique DL ok -> {music_path} delay={music_delay}s vol={music_volume}")
 
         with open(os.path.join(debug_dir, "plan_input.json"), "w", encoding="utf-8") as f:
             json.dump({"plan": plan}, f, ensure_ascii=False, indent=2)
@@ -339,8 +349,6 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
             music_path, music_delay = (None, 0)
             if music_folder_id:
                 music_path, music_delay = _gdrive_pick_and_download_music(music_folder_id, workdir, app.logger, req_id)
-                if music_path:
-                    app.logger.info(f"[{req_id}] musique DL ok -> {music_path} delay={music_delay}s vol={music_volume}")
 
             with open(os.path.join(debug_dir, "plan_input.json"), "w", encoding="utf-8") as f:
                 json.dump({"plan": plan}, f, ensure_ascii=False, indent=2)
