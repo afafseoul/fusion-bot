@@ -1,10 +1,22 @@
 # video_generator.py — encode segments + burn SRT PAR SEGMENT (style CapCut) + concat copy + mux audio (+ musique BG optionnelle)
-import os, time, shutil, subprocess, logging, urllib.request, json, shlex
+import os, time, shutil, subprocess, logging, urllib.request, json, shlex, re
 from typing import Any, Dict, List, Tuple
 from utils.text_overlay import make_segment_srt, SUB_STYLE_CAPCUT
 
 UA = "Mozilla/5.0 (compatible; RenderBot/1.0)"
 DEFAULT_SUB_STYLE = SUB_STYLE_CAPCUT  # style CapCut
+
+# ---- Style "philo" (cadrage + sous-titres) ----
+SUB_STYLE_PHILO = (
+    "Fontname=Arial,Fontsize=42,PrimaryColour=&H00FFFFFF,"
+    "OutlineColour=&H00202020,Outline=3,Shadow=0,BorderStyle=1,"
+    "Alignment=2,MarginL=60,MarginR=60,MarginV=96,Spacing=0,ScaleX=100,ScaleY=100"
+)
+STYLE_SUB_MAP = {
+    "philo": SUB_STYLE_PHILO,
+    "default": DEFAULT_SUB_STYLE,
+    "capcut": DEFAULT_SUB_STYLE,
+}
 
 def _run(cmd: str, logger: logging.Logger, req_id: str):
     logger.info(f"[{req_id}] CMD: {cmd}")
@@ -53,12 +65,31 @@ def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> 
     logger.info(f"[{req_id}] download ok -> {dst}")
     return dst
 
+def _vf_for_style(width: int, height: int, fps: int, style_key: str) -> str:
+    """
+    - default/capcut : comportement actuel (plein cadre)
+    - philo          : média dans un carré plus petit centré, façon 'philosophaire'
+    """
+    sk = (style_key or "default").lower().strip()
+    if sk != "philo":
+        return f"scale={width}:{height}:force_original_aspect_ratio=decrease," \
+               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,fps={fps}"
+
+    inner = int(min(width, height) * 0.78)  # ~842px pour 1080x1920
+    return (
+        f"scale={inner}:{inner}:force_original_aspect_ratio=decrease,"
+        f"pad={inner}:{inner}:(ow-iw)/2:(oh-ih)/2:black,"
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
+        f"fps={fps}"
+    )
+
 def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
                     logger: logging.Logger, req_id: str,
-                    subs_path: str = None, sub_style: str = DEFAULT_SUB_STYLE):
+                    subs_path: str = None, sub_style: str = DEFAULT_SUB_STYLE,
+                    style_key: str = "default"):
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    vf = (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-          f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,fps={fps}")
+    vf = _vf_for_style(width, height, fps, style_key)
     if subs_path:
         vf = f"{vf},subtitles={shlex.quote(subs_path)}:force_style='{sub_style}'"
 
@@ -117,7 +148,7 @@ def _mix_voice_with_music(voice_path: str, music_path: str, start_at_sec: int,
     """
     Mixe la voix avec la musique en commençant la MUSIQUE à start_at_sec.
     -> On coupe le début de la musique avec -ss (pas de délai).
-    -> On normalise le flux mixé et on encode en AAC (conteneur .m4a/.mp4).
+    -> On encode en AAC (conteneur .m4a/.mp4).
     """
     start_at = max(0, int(start_at_sec))
     cmd = (
@@ -131,6 +162,37 @@ def _mix_voice_with_music(voice_path: str, music_path: str, start_at_sec: int,
     )
     _run(cmd, logger, req_id)
 
+# ---- SRT mot par mot (local au segment 0..dur) ----
+def _sec_to_ts(t: float) -> str:
+    t = max(0.0, float(t))
+    ms = int(round(t * 1000))
+    h = ms // 3600000; ms -= h*3600000
+    m = ms // 60000;   ms -= m*60000
+    s = ms // 1000;    ms -= s*1000
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def _make_word_srt(text: str, dur: float, out_path: str, mode: str = "accumulate"):
+    txt = (text or "").strip()
+    if not txt or dur <= 0:
+        open(out_path, "w", encoding="utf-8").write("")
+        return
+    words = re.findall(r"\S+", txt)
+    if not words:
+        open(out_path, "w", encoding="utf-8").write("")
+        return
+    n = len(words)
+    step = max(0.08, dur / n)
+    t = 0.0
+    blocks = []
+    for i, w in enumerate(words):
+        t1 = t
+        t2 = min(dur, t + step)
+        payload = (" ".join(words[:i+1]) if mode == "accumulate" else w)
+        blocks.append(f"{i+1}\n{_sec_to_ts(t1)} --> {_sec_to_ts(t2)}\n{payload}\n")
+        t = t2
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(blocks))
+
 def generate_video(
     plan: List[Dict[str, Any]],
     audio_path: str,
@@ -142,24 +204,32 @@ def generate_video(
     logger: logging.Logger,
     req_id: str,
     sub_style: str = DEFAULT_SUB_STYLE,
+    # NOUVEAU
+    style: str = "default",             # 'default' | 'philo'
+    subtitle_mode: str = "sentence",    # 'sentence' | 'word'
+    word_mode: str = "accumulate",      # 'accumulate' | 'replace'
     # paramètres tolérés en entrée
     global_srt: str = None,
     burn_mode: str = None,
     # musique BG optionnelle
     music_path: str = None,
-    music_delay: int = 0,       # ICI: utilisé comme "start_at" dans la musique (ex: @55 => on démarre à 55s)
+    music_delay: int = 0,       # coupe au début de la musique (ex: @55 => on démarre à 55s)
     music_volume: float = 0.25,
     **kwargs
 ):
     """
     burn_mode:
-      - "segment" (défaut) : sous-titres par segment (style CapCut)
+      - "segment" (défaut) : sous-titres par segment
       - "none"             : pas de sous-titres gravés
 
-    music_path : chemin local de la musique
-    music_delay: position de départ DANS la musique (secondes), ex: @55 => on commence à 55s
-    music_volume: 0.0-1.0
+    subtitle_mode:
+      - "sentence" : EXACTEMENT comme aujourd'hui (si 'subtitles' fourni)
+      - "word"     : affiche mot par mot (accumulate/replace) sur toute la durée du segment
     """
+    style_key = (style or "default").lower().strip()
+    if style_key in STYLE_SUB_MAP:
+        sub_style = STYLE_SUB_MAP[style_key]
+
     mode_burn = (burn_mode or "segment").lower().strip()
     burn_segments = (mode_burn != "none")
 
@@ -191,16 +261,26 @@ def generate_video(
             if not (has_video or is_gif):
                 raise RuntimeError("Downloaded file is not media (got HTML). Lien Drive direct requis.")
 
-        # SRT segment (si fenêtres && burn actif)
+        # SRT segment
         seg_srt = None
-        if has_seg_times:
-            seg_srt = os.path.join(temp_dir, f"seg_{i:03d}.srt")
-            make_segment_srt(seg.get("subtitles"), txt, start, dur, seg_srt)
+        if burn_segments:
+            if subtitle_mode.lower().strip() == "word" and txt:
+                seg_srt = os.path.join(temp_dir, f"seg_{i:03d}.srt")
+                _make_word_srt(txt, dur, seg_srt, mode=(word_mode or "accumulate").lower().strip())
+            elif has_seg_times:
+                seg_srt = os.path.join(temp_dir, f"seg_{i:03d}.srt")
+                make_segment_srt(seg.get("subtitles"), txt, start, dur, seg_srt)
+            else:
+                seg_srt = None  # on garde le comportement actuel (pas de subs sans fenêtres)
 
         # encode uniforme (+ burn éventuel)
         part_path = os.path.join(temp_dir, f"part_{i:03d}.mp4")
-        _encode_uniform(src_for_encode, part_path, width, height, fps, dur, logger, req_id,
-                        subs_path=seg_srt, sub_style=sub_style)
+        _encode_uniform(
+            src_for_encode, part_path, width, height, fps, dur,
+            logger, req_id,
+            subs_path=seg_srt, sub_style=sub_style,
+            style_key=style_key
+        )
         parts.append(part_path)
         if seg.get("start_time") is None:
             t_running += dur
@@ -214,8 +294,7 @@ def generate_video(
 
     audio_for_mux = audio_path
     if music_path:
-        # IMPORTANT: on sort un conteneur compatible AAC (m4a), pas .mp3
-        mixed = os.path.join(temp_dir, "voice_mix.m4a")
+        mixed = os.path.join(temp_dir, "voice_mix.m4a")  # AAC dans conteneur m4a/mp4
         _mix_voice_with_music(
             voice_path=audio_path,
             music_path=music_path,
@@ -232,9 +311,12 @@ def generate_video(
 
     debug = {
         "mode": concat_mode,
-        "subs": ("burned_per_segment" if has_seg_times else ("none" if not burn_segments else "no_times")),
+        "subs": ("burned_per_segment" if has_seg_times or subtitle_mode.lower() == "word" else ("none" if not burn_segments else "no_times")),
         "items": len(parts),
         "burn_mode": mode_burn,
+        "style": style_key,
+        "subtitle_mode": subtitle_mode,
+        "word_mode": word_mode,
         "music": bool(music_path),
         "music_start_at": int(music_delay) if music_path else 0,
         "music_volume": float(music_volume) if music_path else 0.0,
