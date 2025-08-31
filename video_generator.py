@@ -115,25 +115,17 @@ def _mix_voice_with_music(voice_path: str, music_path: str, start_at_sec: int,
                           out_audio_path: str, logger: logging.Logger, req_id: str,
                           music_volume: float = 0.25):
     """
-    Mix voix + musique façon fusion.py :
-      - La musique démarre immédiatement à t=0 de la vidéo,
-        mais on la lit **à partir de start_at_sec** dans le fichier (seek).
-      - Pas d'adelay ici.
-      - Durée de sortie = durée de la voix (amix duration=first).
+    Mixe la voix avec la musique en commençant la MUSIQUE à start_at_sec.
+    -> On coupe le début de la musique avec -ss (pas de délai).
+    -> On normalise le flux mixé et on encode en AAC (conteneur .m4a/.mp4).
     """
-    start_at_sec = max(0, int(start_at_sec or 0))
-    # On place -ss juste avant l'input musique pour un seek rapide.
-    if start_at_sec > 0:
-        music_seek = f"-ss {start_at_sec} "
-    else:
-        music_seek = ""
-
+    start_at = max(0, int(start_at_sec))
     cmd = (
         "ffmpeg -y -hide_banner -loglevel error "
         f"-i {shlex.quote(voice_path)} "
-        f"{music_seek}-i {shlex.quote(music_path)} "
+        f"-ss {start_at} -i {shlex.quote(music_path)} "
         f"-filter_complex \"[1:a]volume={music_volume}[bg];"
-        "[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[a]\" "
+        "[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1[a]\" "
         "-map \"[a]\" -c:a aac -b:a 192k "
         f"{shlex.quote(out_audio_path)}"
     )
@@ -155,7 +147,7 @@ def generate_video(
     burn_mode: str = None,
     # musique BG optionnelle
     music_path: str = None,
-    music_delay: int = 0,       # <-- interprété comme "start_at" dans le fichier musique
+    music_delay: int = 0,       # ICI: utilisé comme "start_at" dans la musique (ex: @55 => on démarre à 55s)
     music_volume: float = 0.25,
     **kwargs
 ):
@@ -164,9 +156,9 @@ def generate_video(
       - "segment" (défaut) : sous-titres par segment (style CapCut)
       - "none"             : pas de sous-titres gravés
 
-    music_path : chemin local MP3 à mixer (tiré du Drive)
-    music_delay: **OFFSET DE LECTURE DANS LE FICHIER MUSIQUE** (ex '@55' => on commence la musique à 55s dès t=0)
-    music_volume: volume relatif musique (0.0-1.0)
+    music_path : chemin local de la musique
+    music_delay: position de départ DANS la musique (secondes), ex: @55 => on commence à 55s
+    music_volume: 0.0-1.0
     """
     mode_burn = (burn_mode or "segment").lower().strip()
     burn_segments = (mode_burn != "none")
@@ -216,21 +208,22 @@ def generate_video(
     if not parts:
         raise ValueError("empty parts")
 
-    # concat (copy) -> mux audio
+    # concat (copy) -> préparation audio
     video_only = os.path.join(temp_dir, "_video.mp4")
     concat_mode = _concat_copy_strict(parts, video_only, logger, req_id)
 
-    # prépare l'audio final (voix ou voix+musique)
     audio_for_mux = audio_path
     if music_path:
-        mixed = os.path.join(temp_dir, "voice_mix.mp3")
+        # IMPORTANT: on sort un conteneur compatible AAC (m4a), pas .mp3
+        mixed = os.path.join(temp_dir, "voice_mix.m4a")
         _mix_voice_with_music(
             voice_path=audio_path,
             music_path=music_path,
-            start_at_sec=int(music_delay),
+            start_at_sec=int(music_delay),   # commence la musique à N secondes
             out_audio_path=mixed,
-            logger=logger, req_id=req_id,
-            music_volume=music_volume,
+            logger=logger,
+            req_id=req_id,
+            music_volume=float(music_volume),
         )
         audio_for_mux = mixed
 
