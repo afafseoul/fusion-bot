@@ -196,13 +196,18 @@ def create_video():
         burn_flag  = str(request.form.get("burn_subs", "1")).lower().strip()
         burn_active = burn_flag not in ("0", "false", "no", "none", "")
 
+        # >>>>> NOUVEAU : style / sous-titres
+        style         = request.form.get("style", "default")
+        subtitle_mode = request.form.get("subtitle_mode", "sentence")
+        word_mode     = request.form.get("word_mode", "accumulate")
+
         # musique optionnelle
         music_folder_id = request.form.get("music_folder_id")
         music_volume    = _parse_float(request.form.get("music_volume", 0.25), 0.25)
 
         drive_folder_id = request.form.get("drive_folder_id") or request.args.get("drive_folder_id")
 
-        app.logger.info(f"[{g.req_id}] fields ok name={output_name} {width}x{height}@{fps} audio={getattr(audio_file,'filename',None)}")
+        app.logger.info(f"[{g.req_id}] fields ok name={output_name} {width}x{height}@{fps} audio={getattr(audio_file,'filename',None)} style={style} smode={subtitle_mode} wmode={word_mode}")
 
         plan = _normalize_plan(plan_str)
 
@@ -243,6 +248,10 @@ def create_video():
             logger=app.logger, req_id=g.req_id,
             global_srt=global_srt,
             burn_mode=("none" if not burn_active else burn_mode),
+            # >>>>> NOUVEAU : style / sous-titres
+            style=style,
+            subtitle_mode=subtitle_mode,
+            word_mode=word_mode,
             # musique
             music_path=music_path,
             music_delay=music_delay,
@@ -321,13 +330,18 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
             burn_flag     = str(fields.get("burn_subs", "1")).lower().strip()
             burn_active   = burn_flag not in ("0", "false", "no", "none", "")
 
+            # >>>>> NOUVEAU : style / sous-titres
+            style         = fields.get("style", "default")
+            subtitle_mode = fields.get("subtitle_mode", "sentence")
+            word_mode     = fields.get("word_mode", "accumulate")
+
             drive_folder_id = fields.get("drive_folder_id")
 
             # musique
             music_folder_id = fields.get("music_folder_id")
             music_volume    = _parse_float(fields.get("music_volume", 0.25), 0.25)
 
-            app.logger.info(f"[{req_id}] (async) start job {jid} name={output_name} {width}x{height}@{fps}")
+            app.logger.info(f"[{req_id}] (async) start job {jid} name={output_name} {width}x{height}@{fps} style={style} smode={subtitle_mode} wmode={word_mode}")
 
             plan = _normalize_plan(plan_str)
 
@@ -370,6 +384,10 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
                 logger=app.logger, req_id=req_id,
                 global_srt=global_srt,
                 burn_mode=("none" if not burn_active else burn_mode),
+                # >>>>> NOUVEAU : style / sous-titres
+                style=style,
+                subtitle_mode=subtitle_mode,
+                word_mode=word_mode,
                 # musique
                 music_path=music_path,
                 music_delay=music_delay,
@@ -448,6 +466,10 @@ def create_video_async():
             "burn_subs": request.form.get("burn_subs", "1"),
             "drive_folder_id": request.form.get("drive_folder_id") or request.args.get("drive_folder_id"),
             "callback_url": request.form.get("callback_url"),
+            # >>>>> NOUVEAU : style / sous-titres
+            "style": request.form.get("style"),
+            "subtitle_mode": request.form.get("subtitle_mode"),
+            "word_mode": request.form.get("word_mode"),
             # musique
             "music_folder_id": request.form.get("music_folder_id"),
             "music_volume": request.form.get("music_volume"),
