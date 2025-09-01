@@ -1,4 +1,4 @@
-# video_generator.py — encode segments + burn SRT PAR SEGMENT (style CapCut) + concat copy + mux audio (+ musique BG optionnelle)
+# video_generator.py — encode segments + burn SRT PAR SEGMENT (style CapCut|philo) + concat copy + mux audio (+ musique BG optionnelle)
 import os, time, shutil, subprocess, logging, urllib.request, json, shlex, re
 from typing import Any, Dict, List, Tuple
 from utils.text_overlay import make_segment_srt, SUB_STYLE_CAPCUT
@@ -18,7 +18,11 @@ STYLE_SUB_MAP = {
     "capcut": DEFAULT_SUB_STYLE,
 }
 
+FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "").strip()  # ex: "1" pour limiter
+
 def _run(cmd: str, logger: logging.Logger, req_id: str):
+    if FFMPEG_THREADS:
+        cmd = f"{cmd} -threads {FFMPEG_THREADS}"
     logger.info(f"[{req_id}] CMD: {cmd}")
     p = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     logger.info(f"[{req_id}] STDERR: {p.stdout}")
@@ -27,10 +31,10 @@ def _run(cmd: str, logger: logging.Logger, req_id: str):
 
 def _ffprobe_json(path: str) -> dict:
     try:
-        out = subprocess.check_output([
-            "ffprobe","-v","error","-print_format","json",
-            "-show_format","-show_streams", path
-        ], stderr=subprocess.STDOUT, timeout=10)
+        out = subprocess.check_output(
+            ["ffprobe","-v","error","-print_format","json","-show_format","-show_streams", path],
+            stderr=subprocess.STDOUT, timeout=10
+        )
         return json.loads(out.decode("utf-8","ignore"))
     except Exception:
         return {}
@@ -67,8 +71,8 @@ def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> 
 
 def _vf_for_style(width: int, height: int, fps: int, style_key: str) -> str:
     """
-    - default/capcut : comportement actuel (plein cadre)
-    - philo          : média dans un carré plus petit centré, façon 'philosophaire'
+    - default/capcut : plein cadre (comportement actuel)
+    - philo          : média dans un carré plus petit centré (façon 'philosophaire')
     """
     sk = (style_key or "default").lower().strip()
     if sk != "philo":
@@ -84,14 +88,26 @@ def _vf_for_style(width: int, height: int, fps: int, style_key: str) -> str:
         f"fps={fps}"
     )
 
+def _safe_subs_path(subs_path: str) -> str:
+    """Retourne subs_path seulement s'il existe et non vide, sinon '' (on n’ajoute pas le filtre)."""
+    try:
+        if subs_path and os.path.isfile(subs_path) and os.path.getsize(subs_path) > 0:
+            return subs_path
+    except Exception:
+        pass
+    return ""
+
 def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
                     logger: logging.Logger, req_id: str,
                     subs_path: str = None, sub_style: str = DEFAULT_SUB_STYLE,
                     style_key: str = "default"):
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     vf = _vf_for_style(width, height, fps, style_key)
-    if subs_path:
-        vf = f"{vf},subtitles={shlex.quote(subs_path)}:force_style='{sub_style}'"
+
+    subs_ok = _safe_subs_path(subs_path)
+    if subs_ok:
+        # IMPORTANT: on ajoute le filtre subtitles seulement si le .srt est non-vide
+        vf = f"{vf},subtitles={shlex.quote(subs_ok)}:force_style='{sub_style}'"
 
     src_low = src.lower()
     is_m3u8 = (src_low.startswith("http") and ".m3u8" in src_low)
@@ -146,9 +162,8 @@ def _mix_voice_with_music(voice_path: str, music_path: str, start_at_sec: int,
                           out_audio_path: str, logger: logging.Logger, req_id: str,
                           music_volume: float = 0.25):
     """
-    Mixe la voix avec la musique en commençant la MUSIQUE à start_at_sec.
-    -> On coupe le début de la musique avec -ss (pas de délai).
-    -> On encode en AAC (conteneur .m4a/.mp4).
+    Mixe la voix avec la MUSIQUE qui démarre à start_at_sec (on coupe le début avec -ss).
+    Encode en AAC dans un conteneur m4a/mp4 pour éviter l’erreur "Exactly one MP3 audio stream".
     """
     start_at = max(0, int(start_at_sec))
     cmd = (
@@ -271,7 +286,7 @@ def generate_video(
                 seg_srt = os.path.join(temp_dir, f"seg_{i:03d}.srt")
                 make_segment_srt(seg.get("subtitles"), txt, start, dur, seg_srt)
             else:
-                seg_srt = None  # on garde le comportement actuel (pas de subs sans fenêtres)
+                seg_srt = None  # pas de subs sans fenêtres
 
         # encode uniforme (+ burn éventuel)
         part_path = os.path.join(temp_dir, f"part_{i:03d}.mp4")
