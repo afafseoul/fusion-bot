@@ -7,8 +7,10 @@ UA = "Mozilla/5.0 (compatible; RenderBot/1.0)"
 DEFAULT_SUB_STYLE = SUB_STYLE_CAPCUT  # style CapCut
 
 # ---- Style "philo" (cadrage + sous-titres) ----
+# NB: DejaVuSans est beaucoup plus souvent présent que Arial sur les environnements Linux (Render).
+SUB_FALLBACK_FONT = os.getenv("SUB_FONT_FALLBACK", "DejaVuSans").strip() or "DejaVuSans"
 SUB_STYLE_PHILO = (
-    "Fontname=Arial,Fontsize=42,PrimaryColour=&H00FFFFFF,"
+    f"Fontname={SUB_FALLBACK_FONT},Fontsize=42,PrimaryColour=&H00FFFFFF,"
     "OutlineColour=&H00202020,Outline=3,Shadow=0,BorderStyle=1,"
     "Alignment=2,MarginL=60,MarginR=60,MarginV=96,Spacing=0,ScaleX=100,ScaleY=100"
 )
@@ -97,17 +99,58 @@ def _safe_subs_path(subs_path: str) -> str:
         pass
     return ""
 
+def _find_fontsdir() -> str:
+    """Essaie de trouver un dossier de polices connu pour libass."""
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu",
+        "/usr/share/fonts/dejavu",
+        "/usr/share/fonts/truetype",
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
+        "/Library/Fonts",  # macOS (au cas où)
+    ]
+    for p in candidates:
+        if os.path.isdir(p):
+            return p
+    return ""
+
+_fontdir_cache = None
+def _get_fontsdir_cached() -> str:
+    global _fontdir_cache
+    if _fontdir_cache is None:
+        _fontdir_cache = _find_fontsdir()
+    return _fontdir_cache
+
+def _force_style_with_font(style: str, fontname: str) -> str:
+    """Remplace/ajoute Fontname=... dans une chaîne force_style."""
+    s = style or ""
+    if "Fontname=" in s:
+        return re.sub(r"Fontname=[^,]+", f"Fontname={fontname}", s)
+    # S'il n'y a pas Fontname=..., on le préfixe
+    if s.strip():
+        return f"Fontname={fontname},{s}"
+    return f"Fontname={fontname}"
+
+def _build_subtitles_filter(subs_file: str, force_style: str) -> str:
+    """Construit le morceau 'subtitles=...:force_style=...' avec fontsdir si dispo."""
+    path_q = shlex.quote(subs_file)
+    fontsdir = _get_fontsdir_cached()
+    if fontsdir:
+        return f"subtitles={path_q}:force_style='{force_style}':fontsdir={shlex.quote(fontsdir)}"
+    return f"subtitles={path_q}:force_style='{force_style}'"
+
 def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
                     logger: logging.Logger, req_id: str,
                     subs_path: str = None, sub_style: str = DEFAULT_SUB_STYLE,
                     style_key: str = "default"):
+    """
+    Robustesse sous-titres:
+      - 1er essai: force_style tel quel (+ fontsdir si dispo)
+      - 2e essai : force_style mais avec Fontname=SUB_FALLBACK_FONT
+      - 3e essai : sans force_style (subtitles simple)
+    """
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    vf = _vf_for_style(width, height, fps, style_key)
-
-    subs_ok = _safe_subs_path(subs_path)
-    if subs_ok:
-        # IMPORTANT: on ajoute le filtre subtitles seulement si le .srt est non-vide
-        vf = f"{vf},subtitles={shlex.quote(subs_ok)}:force_style='{sub_style}'"
+    base_vf = _vf_for_style(width, height, fps, style_key)
 
     src_low = src.lower()
     is_m3u8 = (src_low.startswith("http") and ".m3u8" in src_low)
@@ -119,15 +162,48 @@ def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_
     else:
         in_flags = f'-stream_loop -1 -t {need_dur:.3f} -i {shlex.quote(src)}'
 
-    cmd = (
-        "ffmpeg -y -hide_banner -loglevel error "
-        f"{in_flags} "
-        f'-vf "{vf}" -pix_fmt yuv420p -r {fps} -vsync cfr '
-        "-c:v libx264 -preset superfast -crf 26 "
-        "-movflags +faststart -video_track_timescale 90000 "
-        f"{shlex.quote(dst)}"
-    )
-    _run(cmd, logger, req_id)
+    def _cmd_with_vf(vf_str: str) -> str:
+        return (
+            "ffmpeg -y -hide_banner -loglevel error "
+            f"{in_flags} "
+            f'-vf "{vf_str}" -pix_fmt yuv420p -r {fps} -vsync cfr '
+            "-c:v libx264 -preset superfast -crf 26 "
+            "-movflags +faststart -video_track_timescale 90000 "
+            f"{shlex.quote(dst)}"
+        )
+
+    subs_ok = _safe_subs_path(subs_path)
+
+    # Essai A: avec force_style tel quel
+    if subs_ok:
+        vf1 = f"{base_vf},{_build_subtitles_filter(subs_ok, sub_style)}"
+        try:
+            _run(_cmd_with_vf(vf1), logger, req_id)
+            return
+        except Exception as e1:
+            logger.warning(f"[{req_id}] subtitles with provided style failed, retrying with fallback font: {e1}")
+
+        # Essai B: force_style mais en forçant la police fallback
+        style_fallback = _force_style_with_font(sub_style, SUB_FALLBACK_FONT)
+        vf2 = f"{base_vf},{_build_subtitles_filter(subs_ok, style_fallback)}"
+        try:
+            _run(_cmd_with_vf(vf2), logger, req_id)
+            return
+        except Exception as e2:
+            logger.warning(f"[{req_id}] subtitles with fallback font failed, retrying without force_style: {e2}")
+
+        # Essai C: sans force_style (on évite le crash et on garde des sous-titres)
+        path_q = shlex.quote(subs_ok)
+        fontsdir = _get_fontsdir_cached()
+        if fontsdir:
+            vf3 = f"{base_vf},subtitles={path_q}:fontsdir={shlex.quote(fontsdir)}"
+        else:
+            vf3 = f"{base_vf},subtitles={path_q}"
+        _run(_cmd_with_vf(vf3), logger, req_id)
+        return
+
+    # Pas de sous-titres -> vf simple
+    _run(_cmd_with_vf(base_vf), logger, req_id)
 
 def _concat_copy_strict(parts: List[str], out_path: str, logger: logging.Logger, req_id: str) -> str:
     list_path = out_path + ".txt"
