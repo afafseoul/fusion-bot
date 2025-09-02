@@ -1,288 +1,72 @@
-# video_generator.py — encode segments + burn SRT PAR SEGMENT (style CapCut|philo) + concat copy + mux audio (+ musique BG optionnelle)
+# video_generator.py — encode segments + burn SRT PAR SEGMENT (style CapCut|philo)
 import os, time, shutil, subprocess, logging, urllib.request, json, shlex, re
 from typing import Any, Dict, List, Tuple
 from utils.text_overlay import make_segment_srt, SUB_STYLE_CAPCUT
 
 UA = "Mozilla/5.0 (compatible; RenderBot/1.0)"
-DEFAULT_SUB_STYLE = SUB_STYLE_CAPCUT  # style CapCut
-
-# ---- Style "philo" (cadrage + sous-titres) ----
-# NB: DejaVuSans est beaucoup plus souvent présent que Arial sur les environnements Linux (Render).
+DEFAULT_SUB_STYLE = SUB_STYLE_CAPCUT
 SUB_FALLBACK_FONT = os.getenv("SUB_FONT_FALLBACK", "DejaVuSans").strip() or "DejaVuSans"
+
 SUB_STYLE_PHILO = (
     f"Fontname={SUB_FALLBACK_FONT},Fontsize=42,PrimaryColour=&H00FFFFFF,"
     "OutlineColour=&H00202020,Outline=3,Shadow=0,BorderStyle=1,"
     "Alignment=2,MarginL=60,MarginR=60,MarginV=96,Spacing=0,ScaleX=100,ScaleY=100"
 )
-STYLE_SUB_MAP = {
-    "philo": SUB_STYLE_PHILO,
-    "default": DEFAULT_SUB_STYLE,
-    "capcut": DEFAULT_SUB_STYLE,
-}
+STYLE_SUB_MAP = {"philo": SUB_STYLE_PHILO, "default": DEFAULT_SUB_STYLE, "capcut": DEFAULT_SUB_STYLE}
 
-FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "").strip()  # ex: "1" pour limiter
+FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "").strip()
 
+# -------------------- helpers --------------------
 def _run(cmd: str, logger: logging.Logger, req_id: str):
-    if FFMPEG_THREADS:
-        cmd = f"{cmd} -threads {FFMPEG_THREADS}"
+    if FFMPEG_THREADS: cmd = f"{cmd} -threads {FFMPEG_THREADS}"
     logger.info(f"[{req_id}] CMD: {cmd}")
     p = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     logger.info(f"[{req_id}] STDERR: {p.stdout}")
-    if p.returncode != 0:
-        raise RuntimeError(f"Command failed: {cmd}")
+    if p.returncode != 0: raise RuntimeError(f"Command failed: {cmd}")
 
 def _ffprobe_json(path: str) -> dict:
     try:
-        out = subprocess.check_output(
-            ["ffprobe","-v","error","-print_format","json","-show_format","-show_streams", path],
-            stderr=subprocess.STDOUT, timeout=10
-        )
+        out = subprocess.check_output(["ffprobe","-v","error","-print_format","json","-show_format","-show_streams", path],
+            stderr=subprocess.STDOUT, timeout=10)
         return json.loads(out.decode("utf-8","ignore"))
-    except Exception:
-        return {}
+    except Exception: return {}
 
-def _kind(path: str) -> Tuple[bool, bool]:
+def _is_good_mp4(path: str, logger, req_id: str) -> bool:
     info = _ffprobe_json(path)
-    fm = (info.get("format",{}) or {}).get("format_name","") or ""
-    has_video = any((s or {}).get("codec_type") == "video" for s in info.get("streams",[]))
-    is_gif = ("gif" in fm.lower()) or path.lower().endswith(".gif")
-    return has_video, is_gif
+    for s in info.get("streams", []):
+        if s.get("codec_type") == "video":
+            codec, pix_fmt = s.get("codec_name"), s.get("pix_fmt")
+            w, h = s.get("width", 0), s.get("height", 0)
+            logger.info(f"[{req_id}] check {path} codec={codec} pix_fmt={pix_fmt} res={w}x{h}")
+            return codec == "h264" and pix_fmt == "yuv420p" and w <= 1080 and h <= 1920
+    return False
 
-def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> str:
-    os.makedirs(os.path.dirname(dst_noext), exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": "https://www.pinterest.com/"})
-    with urllib.request.urlopen(req, timeout=45) as r:
-        ct = (r.info().get_content_type() or "").lower()
-        if "gif" in ct: ext = ".gif"
-        elif "mp4" in ct or "video/" in ct: ext = ".mp4"
-        else:
-            low = url.lower()
-            if ".gif" in low: ext = ".gif"
-            elif ".mp4" in low: ext = ".mp4"
-            else: ext = ".bin"
-        dst = dst_noext + ext
-        with open(dst, "wb") as f: shutil.copyfileobj(r, f)
-    if os.path.getsize(dst) <= 0:
-        raise RuntimeError("downloaded file is empty")
-    if dst.endswith(".bin"):
-        head = open(dst, "rb").read(512).lower()
-        if b"<html" in head or b"<!doctype html" in head:
-            raise RuntimeError("Downloaded file is not media (got HTML). Lien Drive direct requis.")
-    logger.info(f"[{req_id}] download ok -> {dst}")
-    return dst
-
-def _vf_for_style(width: int, height: int, fps: int, style_key: str) -> str:
-    """
-    - default/capcut : plein cadre (comportement actuel)
-    - philo          : média dans un carré plus petit centré (façon 'philosophaire')
-    """
-    sk = (style_key or "default").lower().strip()
-    if sk != "philo":
-        return f"scale={width}:{height}:force_original_aspect_ratio=decrease," \
-               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,fps={fps}"
-
-    inner = int(min(width, height) * 0.78)  # ~842px pour 1080x1920
-    return (
-        f"scale={inner}:{inner}:force_original_aspect_ratio=decrease,"
-        f"pad={inner}:{inner}:(ow-iw)/2:(oh-ih)/2:black,"
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
-        f"fps={fps}"
-    )
-
-def _safe_subs_path(subs_path: str) -> str:
-    """Retourne subs_path seulement s'il existe et non vide, sinon '' (on n’ajoute pas le filtre)."""
-    try:
-        if subs_path and os.path.isfile(subs_path) and os.path.getsize(subs_path) > 0:
-            return subs_path
-    except Exception:
-        pass
-    return ""
-
-def _find_fontsdir() -> str:
-    """Essaie de trouver un dossier de polices connu pour libass."""
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu",
-        "/usr/share/fonts/dejavu",
-        "/usr/share/fonts/truetype",
-        "/usr/share/fonts",
-        "/usr/local/share/fonts",
-        "/Library/Fonts",  # macOS (au cas où)
-    ]
-    for p in candidates:
-        if os.path.isdir(p):
-            return p
-    return ""
-
-_fontdir_cache = None
-def _get_fontsdir_cached() -> str:
-    global _fontdir_cache
-    if _fontdir_cache is None:
-        _fontdir_cache = _find_fontsdir()
-    return _fontdir_cache
-
-def _force_style_with_font(style: str, fontname: str) -> str:
-    """Remplace/ajoute Fontname=... dans une chaîne force_style."""
-    s = style or ""
-    if "Fontname=" in s:
-        return re.sub(r"Fontname=[^,]+", f"Fontname={fontname}", s)
-    # S'il n'y a pas Fontname=..., on le préfixe
-    if s.strip():
-        return f"Fontname={fontname},{s}"
-    return f"Fontname={fontname}"
-
-def _build_subtitles_filter(subs_file: str, force_style: str) -> str:
-    """Construit le morceau 'subtitles=...:force_style=...' avec fontsdir si dispo."""
-    path_q = shlex.quote(subs_file)
-    fontsdir = _get_fontsdir_cached()
-    if fontsdir:
-        return f"subtitles={path_q}:force_style='{force_style}':fontsdir={shlex.quote(fontsdir)}"
-    return f"subtitles={path_q}:force_style='{force_style}'"
-
+# -------------------- encode --------------------
 def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
                     logger: logging.Logger, req_id: str,
                     subs_path: str = None, sub_style: str = DEFAULT_SUB_STYLE,
                     style_key: str = "default"):
-    """
-    Robustesse sous-titres:
-      - 1er essai: force_style tel quel (+ fontsdir si dispo)
-      - 2e essai : force_style mais avec Fontname=SUB_FALLBACK_FONT
-      - 3e essai : sans force_style (subtitles simple)
-    """
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    base_vf = _vf_for_style(width, height, fps, style_key)
 
-    src_low = src.lower()
-    is_m3u8 = (src_low.startswith("http") and ".m3u8" in src_low)
-    if is_m3u8:
-        in_flags = ('-protocol_whitelist "file,http,https,tcp,tls,crypto" '
-                    f'-t {need_dur:.3f} -i {shlex.quote(src)}')
-    elif src_low.endswith(".gif"):
-        in_flags = f'-ignore_loop 0 -t {need_dur:.3f} -i {shlex.quote(src)}'
-    else:
-        in_flags = f'-stream_loop -1 -t {need_dur:.3f} -i {shlex.quote(src)}'
-
-    def _cmd_with_vf(vf_str: str) -> str:
-        return (
-            "ffmpeg -y -hide_banner -loglevel error "
-            f"{in_flags} "
-            f'-vf "{vf_str}" -pix_fmt yuv420p -r {fps} -vsync cfr '
-            "-c:v libx264 -preset superfast -crf 26 "
-            "-movflags +faststart -video_track_timescale 90000 "
-            f"{shlex.quote(dst)}"
-        )
-
-    subs_ok = _safe_subs_path(subs_path)
-
-    # Essai A: avec force_style tel quel
-    if subs_ok:
-        vf1 = f"{base_vf},{_build_subtitles_filter(subs_ok, sub_style)}"
-        try:
-            _run(_cmd_with_vf(vf1), logger, req_id)
-            return
-        except Exception as e1:
-            logger.warning(f"[{req_id}] subtitles with provided style failed, retrying with fallback font: {e1}")
-
-        # Essai B: force_style mais en forçant la police fallback
-        style_fallback = _force_style_with_font(sub_style, SUB_FALLBACK_FONT)
-        vf2 = f"{base_vf},{_build_subtitles_filter(subs_ok, style_fallback)}"
-        try:
-            _run(_cmd_with_vf(vf2), logger, req_id)
-            return
-        except Exception as e2:
-            logger.warning(f"[{req_id}] subtitles with fallback font failed, retrying without force_style: {e2}")
-
-        # Essai C: sans force_style (on évite le crash et on garde des sous-titres)
-        path_q = shlex.quote(subs_ok)
-        fontsdir = _get_fontsdir_cached()
-        if fontsdir:
-            vf3 = f"{base_vf},subtitles={path_q}:fontsdir={shlex.quote(fontsdir)}"
-        else:
-            vf3 = f"{base_vf},subtitles={path_q}"
-        _run(_cmd_with_vf(vf3), logger, req_id)
+    if src.lower().endswith(".mp4") and _is_good_mp4(src, logger, req_id) and not subs_path:
+        shutil.copy2(src, dst)
+        logger.info(f"[{req_id}] ✅ skip re-encode (déjà bon format) -> {dst}")
         return
 
-    # Pas de sous-titres -> vf simple
-    _run(_cmd_with_vf(base_vf), logger, req_id)
+    base_vf = f"scale={width}:{height}:force_original_aspect_ratio=decrease," \
+              f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,fps={fps}"
+    if subs_path:
+        base_vf = f"{base_vf},subtitles={shlex.quote(subs_path)}:force_style='{sub_style}'"
 
-def _concat_copy_strict(parts: List[str], out_path: str, logger: logging.Logger, req_id: str) -> str:
-    list_path = out_path + ".txt"
-    with open(list_path, "w") as f:
-        for p in parts: f.write(f"file '{os.path.abspath(p)}'\n")
+    in_flags = f'-t {need_dur:.3f} -i {shlex.quote(src)}'
     cmd = ("ffmpeg -y -hide_banner -loglevel error "
-           f"-f concat -safe 0 -i {shlex.quote(list_path)} "
-           "-fflags +genpts -avoid_negative_ts make_zero -c copy -movflags +faststart "
-           f"{shlex.quote(out_path)}")
-    try:
-        _run(cmd, logger, req_id); return "concat_copy"
-    except Exception:
-        inputs = " ".join(f"-i {shlex.quote(p)}" for p in parts)
-        n = len(parts); maps = "".join(f"[{i}:v:0]" for i in range(n))
-        cmd2 = (f"ffmpeg -y -hide_banner -loglevel error {inputs} "
-                f"-filter_complex \"{maps}concat=n={n}:v=1:a=0[v]\" "
-                "-map \"[v]\" -c:v libx264 -preset superfast -crf 26 "
-                "-pix_fmt yuv420p -movflags +faststart -r 30 "
-                "-video_track_timescale 90000 "
-                f"{shlex.quote(out_path)}")
-        _run(cmd2, logger, req_id); return "concat_filter"
-
-def _mux_audio(video_path: str, audio_path: str, out_path: str, logger: logging.Logger, req_id: str):
-    cmd = ("ffmpeg -y -hide_banner -loglevel error "
-           f"-i {shlex.quote(video_path)} -i {shlex.quote(audio_path)} "
-           "-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 128k "
-           "-shortest -movflags +faststart "
-           f"{shlex.quote(out_path)}")
+           f"{in_flags} -vf \"{base_vf}\" -pix_fmt yuv420p -r {fps} -vsync cfr "
+           "-c:v libx264 -preset superfast -crf 26 "
+           "-movflags +faststart -video_track_timescale 90000 "
+           f"{shlex.quote(dst)}")
     _run(cmd, logger, req_id)
 
-def _mix_voice_with_music(voice_path: str, music_path: str, start_at_sec: int,
-                          out_audio_path: str, logger: logging.Logger, req_id: str,
-                          music_volume: float = 0.25):
-    """
-    Mixe la voix avec la MUSIQUE qui démarre à start_at_sec (on coupe le début avec -ss).
-    Encode en AAC dans un conteneur m4a/mp4 pour éviter l’erreur "Exactly one MP3 audio stream".
-    """
-    start_at = max(0, int(start_at_sec))
-    cmd = (
-        "ffmpeg -y -hide_banner -loglevel error "
-        f"-i {shlex.quote(voice_path)} "
-        f"-ss {start_at} -i {shlex.quote(music_path)} "
-        f"-filter_complex \"[1:a]volume={music_volume}[bg];"
-        "[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1[a]\" "
-        "-map \"[a]\" -c:a aac -b:a 192k "
-        f"{shlex.quote(out_audio_path)}"
-    )
-    _run(cmd, logger, req_id)
-
-# ---- SRT mot par mot (local au segment 0..dur) ----
-def _sec_to_ts(t: float) -> str:
-    t = max(0.0, float(t))
-    ms = int(round(t * 1000))
-    h = ms // 3600000; ms -= h*3600000
-    m = ms // 60000;   ms -= m*60000
-    s = ms // 1000;    ms -= s*1000
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-def _make_word_srt(text: str, dur: float, out_path: str, mode: str = "accumulate"):
-    txt = (text or "").strip()
-    if not txt or dur <= 0:
-        open(out_path, "w", encoding="utf-8").write("")
-        return
-    words = re.findall(r"\S+", txt)
-    if not words:
-        open(out_path, "w", encoding="utf-8").write("")
-        return
-    n = len(words)
-    step = max(0.08, dur / n)
-    t = 0.0
-    blocks = []
-    for i, w in enumerate(words):
-        t1 = t
-        t2 = min(dur, t + step)
-        payload = (" ".join(words[:i+1]) if mode == "accumulate" else w)
-        blocks.append(f"{i+1}\n{_sec_to_ts(t1)} --> {_sec_to_ts(t2)}\n{payload}\n")
-        t = t2
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(blocks))
+# -------------------- generate_video --------------------
 
 def generate_video(
     plan: List[Dict[str, Any]],
