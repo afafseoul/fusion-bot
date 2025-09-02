@@ -33,6 +33,13 @@ def _gdrive_service():
     creds = Credentials.from_service_account_file(GOOGLE_CREDS_PATH, scopes=scopes)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
+def _sa_email() -> str:
+    try:
+        creds = Credentials.from_service_account_file(GOOGLE_CREDS_PATH, scopes=["https://www.googleapis.com/auth/drive"])
+        return getattr(creds, "service_account_email", "")
+    except Exception:
+        return ""
+
 def _gdrive_upload(file_path: str, file_name: str, folder_id: Optional[str], logger, req_id: str):
     svc = _gdrive_service()
     meta = {"name": file_name}
@@ -118,7 +125,6 @@ def _normalize_plan(raw: Any) -> List[Dict[str, Any]]:
     """Accepte string JSON (ou objet) et renvoie le tableau `plan`."""
     if isinstance(raw, (bytes, bytearray)): raw = raw.decode("utf-8","ignore")
     if isinstance(raw, str):
-        # trace courte
         try:
             app.logger.info(f"[{g.req_id}] plan_len={len(raw)} head={raw[:400].replace(chr(10),' ')}")
         except Exception:
@@ -126,7 +132,6 @@ def _normalize_plan(raw: Any) -> List[Dict[str, Any]]:
         try:
             raw = json.loads(raw)
         except json.JSONDecodeError:
-            # si OpenAI a ajouté du texte après, on coupe au dernier '}'
             last = raw.rfind("}")
             if last != -1:
                 raw = json.loads(raw[:last+1])
@@ -157,10 +162,31 @@ def _end(resp):
         pass
     return resp
 
-# -------------------- Health --------------------
+# -------------------- Health & Debug --------------------
 @app.get("/")
 def root():
     return jsonify(ok=True, service="fusion-bot", ts=int(time.time()))
+
+@app.get("/whoami-drive")
+def whoami_drive():
+    return jsonify(service_account_email=_sa_email())
+
+def _drive_resolve_target_id(file_id: str) -> str:
+    """
+    Si file_id est un raccourci (application/vnd.google-apps.shortcut),
+    on renvoie shortcutDetails.targetId; sinon on renvoie file_id tel quel.
+    """
+    svc = _gdrive_service()
+    meta = svc.files().get(
+        fileId=file_id,
+        fields="id,name,mimeType,shortcutDetails/targetId,parents",
+        supportsAllDrives=True
+    ).execute()
+    if meta.get("mimeType") == "application/vnd.google-apps.shortcut":
+        tgt = (meta.get("shortcutDetails") or {}).get("targetId")
+        if tgt:
+            return tgt
+    return file_id
 
 # -------------------- PRE-ENCODE (file_id ONLY) --------------------
 @app.post("/pre-encode")
@@ -194,21 +220,36 @@ def pre_encode():
         if not file_id:
             raise ValueError("Missing 'file_id'")
 
-        # 1) Télécharger via API Drive (aucun partage public requis)
+        # 1) Résolution des raccourcis éventuels
+        try:
+            resolved_id = _drive_resolve_target_id(file_id)
+        except Exception as e:
+            app.logger.error(f"[{req_id}] resolve_id failed for {file_id}: {e}")
+            resolved_id = file_id
+
+        # 2) Téléchargement via API Drive
         local_src = os.path.join(workdir, "src")
         svc = _gdrive_service()
-        req = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
-        with open(local_src, "wb") as f:
-            downloader = MediaIoBaseDownload(f, req)
-            done = False
-            while not done:
-                _status, done = downloader.next_chunk()
+        try:
+            req = svc.files().get_media(fileId=resolved_id, supportsAllDrives=True)
+            with open(local_src, "wb") as f:
+                downloader = MediaIoBaseDownload(f, req)
+                done = False
+                while not done:
+                    _status, done = downloader.next_chunk()
+        except Exception as e:
+            sa = _sa_email()
+            app.logger.error(
+                f"[{req_id}] Drive download 404/perm for file_id={file_id} resolved={resolved_id}. "
+                f"Probablement pas partagé avec {sa}. Erreur: {e}"
+            )
+            raise
 
-        # 2) Encodage 1080x1920@30 H.264 (on garde ta durée 30s)
+        # 3) Encodage 1080x1920@30 H.264 (durée 30s comme avant)
         local_out = os.path.join(workdir, output_name)
         _encode_uniform(local_src, local_out, 1080, 1920, 30, 30.0, app.logger, req_id)
 
-        # 3) Upload Drive (si demandé)
+        # 4) Upload Drive (si demandé)
         if drive_folder_id:
             gd = _gdrive_upload(local_out, output_name, drive_folder_id, app.logger, req_id)
             return jsonify({
@@ -269,7 +310,6 @@ def create_video():
         req_id = g.req_id
         app.logger.info(f"[{req_id}] create-video name={output_name} {width}x{height}@{fps} audio={getattr(audio_file,'filename',None)}")
 
-        # espace disque indicatif
         try:
             total_dur = sum(float(max(0.0, (seg.get("duration") or 0))) for seg in plan)
         except Exception:
@@ -281,28 +321,24 @@ def create_video():
         debug_dir = os.path.join(workdir, "debug")
         os.makedirs(debug_dir, exist_ok=True)
 
-        # audio
         audio_path = os.path.join(workdir, "voice.mp3")
         audio_file.save(audio_path)
         audio_size = os.path.getsize(audio_path)
         audio_dur = _ffprobe_duration(audio_path)
         app.logger.info(f"[{req_id}] audio path={audio_path} size={audio_size}B dur={audio_dur:.3f}s")
 
-        # dump debug
         with open(os.path.join(debug_dir, "plan_input.json"), "w", encoding="utf-8") as f:
             f.write(json.dumps(plan, ensure_ascii=False, indent=2))
         if global_srt:
             with open(os.path.join(debug_dir, "global_srt.srt"), "w", encoding="utf-8") as f:
                 f.write(global_srt)
 
-        # musique optionnelle
         music_path, music_start = (None, 0)
         if music_folder_id:
             music_path, music_start = _gdrive_pick_and_download_music(music_folder_id, workdir, app.logger, req_id)
             if music_path:
                 app.logger.info(f"[{req_id}] music picked: {music_path} @ {music_start}s vol={music_volume}")
 
-        # génération
         final_path, dbg = generate_video(
             plan=plan,
             audio_path=audio_path,
@@ -321,7 +357,6 @@ def create_video():
             music_volume=music_volume
         )
 
-        # upload final
         resp = {"status":"success","output_path":final_path,"width":width,"height":height,"fps":fps, **dbg}
         if drive_folder_id:
             up = _gdrive_upload(final_path, output_name, drive_folder_id, app.logger, req_id)
@@ -349,7 +384,6 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
     _set_job(jid, status="running", started_at=int(time.time()), req_id=req_id)
     workdir = None
     try:
-        # reconstruire inputs disque
         workdir = tempfile.mkdtemp(prefix=f"job_{jid}_")
         audio_path = os.path.join(workdir, "voice.mp3")
         with open(audio_path, "wb") as f:
@@ -388,7 +422,6 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
 
         _set_job(jid, status="done", finished_at=int(time.time()), result=out)
 
-        # callback si fourni
         cb = fields.get("callback_url")
         if cb and _requests:
             try:
@@ -406,15 +439,6 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
 
 @app.post("/create-video-async")
 def create_video_async():
-    """
-    Enqueue un job:
-      - output_name, width, height, fps
-      - plan (JSON ou string), audio_file (mp3)
-      - global_srt/style/subtitle_mode/word_mode/burn_mode (optionnels)
-      - music_folder_id/music_volume/music_delay (optionnels)
-      - drive_folder_id (optionnel)
-      - callback_url (optionnel) : POST JSON quand le job termine
-    """
     jid = request.form.get("job_id") or str(uuid4())
     req_id = request.headers.get("X-Request-ID", str(uuid4()))
     tmp = tempfile.mkdtemp(prefix=f"enqueue_{jid}_")
@@ -476,5 +500,6 @@ def list_jobs():
 
 # -------------------- main --------------------
 if __name__ == "__main__":
+    app.logger.info(f"Service Account email: {_sa_email()}")
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, debug=True)
