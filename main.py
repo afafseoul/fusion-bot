@@ -148,9 +148,22 @@ def pre_encode():
     workdir = tempfile.mkdtemp(prefix="preenc_")
     req_id = str(uuid4())
     try:
-        url = request.form["url"]
-        output_name = request.form.get("output_name", "preencoded.mp4")
-        drive_folder_id = request.form.get("drive_folder_id")
+        data = request.get_json(silent=True) or {}
+        def pick(*keys):
+            for k in keys:
+                v = data.get(k)
+                if v: return v
+            for k in keys:
+                v = request.form.get(k)
+                if v: return v
+            return None
+
+        url = pick("url", "web_content_link", "dl_url")
+        output_name = pick("output_name", "out_name") or "preencoded.mp4"
+        drive_folder_id = pick("drive_folder_id", "out_folder_id", "folder_id")
+
+        if not url:
+            raise ValueError("Missing 'url'")
 
         local_src = os.path.join(workdir, "src")
         with urllib.request.urlopen(url) as r, open(local_src, "wb") as f:
@@ -161,14 +174,14 @@ def pre_encode():
 
         if drive_folder_id:
             gd = _gdrive_upload(local_out, output_name, drive_folder_id, app.logger, req_id)
-            return jsonify({"status": "success", "drive_file_id": gd.get("id"), "drive_webViewLink": gd.get("webViewLink")})
-        else:
-            return jsonify({"status": "success", "local_path": local_out})
+            return jsonify({"status":"success","drive_file_id":gd.get("id"),"drive_webViewLink":gd.get("webViewLink")})
+        return jsonify({"status":"success","local_path":local_out})
     except Exception as e:
         app.logger.error(f"[{req_id}] pre-encode failed: {e}\n{traceback.format_exc()}")
         return jsonify(error=str(e)), 500
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
 
 # -------------------- CREATE-VIDEO (SYNC + ASYNC) --------------------
 # >>> ton code /create-video et /create-video-async inchangé
