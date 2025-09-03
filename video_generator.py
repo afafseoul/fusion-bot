@@ -3,9 +3,15 @@ import os, time, shutil, subprocess, logging, urllib.request, json, shlex, re
 from typing import Any, Dict, List, Tuple
 from utils.text_overlay import make_segment_srt, SUB_STYLE_CAPCUT
 
+# --- Google Drive (fallback API si lien HTTP renvoie une page HTML) ---
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+
 UA = "Mozilla/5.0 (compatible; RenderBot/1.0)"
 DEFAULT_SUB_STYLE = SUB_STYLE_CAPCUT
 SUB_FALLBACK_FONT = os.getenv("SUB_FONT_FALLBACK", "DejaVuSans").strip() or "DejaVuSans"
+GOOGLE_CREDS_PATH = os.getenv("GOOGLE_CREDS", "/etc/secrets/credentials.json")
 
 SUB_STYLE_PHILO = (
     f"Fontname={SUB_FALLBACK_FONT},Fontsize=42,PrimaryColour=&H00FFFFFF,"
@@ -47,7 +53,7 @@ def _fps_from_stream(s: dict) -> float:
 
 def _is_good_mp4(path: str, logger, req_id: str) -> bool:
     """
-    Tolérant (<=1080x1920). Le strict (exact 1080x1920@30 h264/yuv420p) est contrôlé en amont par /create-video-async.
+    Tolérant (<=1080x1920). Le strict exact est contrôlé en amont par l'appelant.
     """
     info = _ffprobe_json(path)
     for s in info.get("streams", []):
@@ -58,7 +64,54 @@ def _is_good_mp4(path: str, logger, req_id: str) -> bool:
             return codec == "h264" and pix_fmt == "yuv420p" and w <= 1080 and h <= 1920
     return False
 
-# -------------------- download & kind --------------------
+# -------------------- Google Drive helpers --------------------
+def _gdrive_service():
+    creds = Credentials.from_service_account_file(
+        GOOGLE_CREDS_PATH, scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+def _mime_to_ext(mime: str, fallback=".mp4") -> str:
+    m = (mime or "").lower()
+    if "mp4" in m: return ".mp4"
+    if "gif" in m: return ".gif"
+    if "quicktime" in m or m.endswith("/mov"): return ".mov"
+    if "webm" in m: return ".webm"
+    return fallback
+
+def _extract_drive_id_from_url(url: str) -> str:
+    """
+    Supporte:
+      - https://drive.google.com/uc?id=FILE_ID&export=download
+      - https://drive.google.com/file/d/FILE_ID/view
+    """
+    if not url: return ""
+    m = re.search(r"[?&]id=([a-zA-Z0-9_-]{10,})", url)
+    if m: return m.group(1)
+    m = re.search(r"/file/d/([a-zA-Z0-9_-]{10,})", url)
+    if m: return m.group(1)
+    return ""
+
+def _download_drive_file(file_id: str, dst_noext: str, logger: logging.Logger, req_id: str) -> str:
+    svc = _gdrive_service()
+    meta = svc.files().get(
+        fileId=file_id,
+        fields="id,name,mimeType",
+        supportsAllDrives=True
+    ).execute()
+    ext = _mime_to_ext(meta.get("mimeType"), fallback=".mp4")
+    dst = dst_noext + ext
+
+    req = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
+    with open(dst, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, req)
+        done = False
+        while not done:
+            _status, done = downloader.next_chunk()
+    logger.info(f"[{req_id}] drive downloaded -> {dst} (mime={meta.get('mimeType')})")
+    return dst
+
+# -------------------- download (HTTP + fallback Drive API) --------------------
 def _guess_ext_from_url_or_ct(url: str, content_type: str) -> str:
     if content_type:
         ct = content_type.lower()
@@ -70,12 +123,9 @@ def _guess_ext_from_url_or_ct(url: str, content_type: str) -> str:
     for ext in (".mp4",".gif",".mov",".webm",".m4v"):
         if ext in u:
             return ext
-    return ".mp4"  # fallback raisonnable
+    return ".mp4"
 
-def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> str:
-    """
-    Télécharge URL (Drive uc?id=..., webContentLink, Giphy, etc.) et renvoie le chemin final avec extension.
-    """
+def _download_http(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> str:
     os.makedirs(os.path.dirname(dst_noext), exist_ok=True)
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": "https://example.com"})
     with urllib.request.urlopen(req, timeout=60) as r:
@@ -84,13 +134,10 @@ def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> 
         dst = dst_noext + ext
         with open(dst, "wb") as f:
             shutil.copyfileobj(r, f)
-    logger.info(f"[{req_id}] downloaded -> {dst}")
+    logger.info(f"[{req_id}] downloaded (HTTP) -> {dst}")
     return dst
 
 def _kind(path: str) -> Tuple[bool, bool]:
-    """
-    Retourne (has_video, is_gif) via ffprobe + extension.
-    """
     try:
         out = subprocess.check_output(
             ["ffprobe","-v","error","-select_streams","v:0","-show_streams","-of","json", path],
@@ -103,16 +150,39 @@ def _kind(path: str) -> Tuple[bool, bool]:
     is_gif = path.lower().endswith(".gif")
     return has_video, is_gif
 
-# -------------------- encode (fallback) --------------------
+def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> str:
+    """
+    1) Télécharge en HTTP (webContentLink…)
+    2) Vérifie si c’est bien une vidéo via ffprobe
+    3) Si ce n’est pas du média (HTML), tente Drive API en extrayant file_id
+    """
+    # HTTP direct
+    path = _download_http(url, dst_noext, logger, req_id)
+    has_video, _isgif = _kind(path)
+    if has_video:
+        return path
+
+    # fallback Drive API si lien Drive
+    file_id = _extract_drive_id_from_url(url)
+    if file_id:
+        logger.info(f"[{req_id}] HTTP returned non-media; falling back to Drive API for id={file_id}")
+        try:
+            return _download_drive_file(file_id, dst_noext, logger, req_id)
+        except Exception as e:
+            raise RuntimeError(f"Drive API fallback failed: {e}")
+
+    raise RuntimeError("Downloaded file is not media (got HTML). Lien Drive direct requis.")
+
+# -------------------- encode --------------------
 def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
                     logger: logging.Logger, req_id: str,
                     subs_path: str = None, sub_style: str = DEFAULT_SUB_STYLE,
                     style_key: str = "default",
                     strict: bool = False):
     """
-    - Si strict=True : aucun ré-encodage autorisé (copie pure) dès lors qu'il n'y a PAS de sous-titres à graver.
-      -> Si le fichier n'est pas un MP4 'bon format', on lève une erreur.
-    - Si strict=False : comportement historique (ré-encode si nécessaire).
+    - strict=True : aucun ré-encodage autorisé (copie) s’il n’y a PAS de sous-titres à graver.
+      -> Sinon, on lève une erreur (mauvais format).
+    - strict=False : ré-encodage autorisé si nécessaire (comportement historique).
     """
     os.makedirs(os.path.dirname(dst), exist_ok=True)
 
@@ -122,7 +192,6 @@ def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_
         return
 
     if strict and not subs_path:
-        # En mode strict (async + pas de subs), on ne doit jamais réencoder.
         raise RuntimeError("Mauvais format, malgré pré-encode")
 
     base_vf = f"scale={width}:{height}:force_original_aspect_ratio=decrease," \
@@ -138,7 +207,7 @@ def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_
            f"{shlex.quote(dst)}")
     _run(cmd, logger, req_id)
 
-# -------------------- word-by-word SRT (local) --------------------
+# -------------------- word-by-word SRT --------------------
 def _fmt_ts(t: float) -> str:
     ms = int(round(t * 1000.0))
     h = ms // 3600000
@@ -158,10 +227,7 @@ def _make_word_srt(text: str, duration: float, srt_path: str, mode: str = "accum
         t0 = 0.0
         for i, w in enumerate(words):
             t1 = duration if i == len(words) - 1 else (i + 1) * step
-            if mode == "replace":
-                line = w
-            else:
-                line = " ".join(words[:i+1])
+            line = w if mode == "replace" else " ".join(words[:i+1])
             f.write(f"{i+1}\n{_fmt_ts(t0)} --> { _fmt_ts(t1) }\n{line}\n\n")
             t0 = t1
 
@@ -274,7 +340,7 @@ def generate_video(
 
         # source
         if url.lower().startswith("http") and ".m3u8" in url.lower():
-            src_for_encode = url
+            src_for_encode = url  # HLS
         else:
             base = os.path.join(temp_dir, f"src_{int(time.time()*1000)}_{i}")
             src_for_encode = _download(url, base, logger, req_id)
@@ -301,7 +367,7 @@ def generate_video(
             logger, req_id,
             subs_path=seg_srt, sub_style=sub_style,
             style_key=style_key,
-            strict=strict_preencoded and not seg_srt  # strict seulement s'il n'y a PAS de subs à graver
+            strict=strict_preencoded and not seg_srt
         )
         parts.append(part_path)
         if seg.get("start_time") is None:
@@ -320,7 +386,7 @@ def generate_video(
         _mix_voice_with_music(
             voice_path=audio_path,
             music_path=music_path,
-            start_at_sec=int(music_delay),   # commence la musique à N secondes
+            start_at_sec=int(music_delay),
             out_audio_path=mixed,
             logger=logger,
             req_id=req_id,
