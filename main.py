@@ -498,6 +498,70 @@ def list_jobs():
         ]
     return jsonify(items)
 
+
+
+@app.post("/test-video")
+def test_video():
+    """
+    multipart/form-data:
+      - file (File) : MP4 à vérifier
+    Réponse: {ok: bool, details:{codec,pix_fmt,width,height,fps}, errors:[...]}
+    """
+    req_id = str(uuid4())
+    tmpdir = tempfile.mkdtemp(prefix="testvid_")
+    errors = []
+    try:
+        if "file" not in request.files:
+            return jsonify(ok=False, errors=["Missing file upload (key=file)"]), 400
+
+        f = request.files["file"]
+        local = os.path.join(tmpdir, f.filename or "video.mp4")
+        f.save(local)
+
+        # ffprobe
+        import json, subprocess
+        probe = subprocess.check_output(
+            ["ffprobe","-v","error","-print_format","json","-select_streams","v:0",
+             "-show_streams","-show_format", local],
+            stderr=subprocess.STDOUT
+        ).decode("utf-8","ignore")
+        info = json.loads(probe)
+        v = next((s for s in info.get("streams",[]) if s.get("codec_type")=="video"), {})
+
+        codec   = v.get("codec_name")
+        pix_fmt = v.get("pix_fmt")
+        width   = int(v.get("width") or 0)
+        height  = int(v.get("height") or 0)
+
+        # fps: priorité avg_frame_rate sinon r_frame_rate
+        def _fps(s):
+            val = s.get("avg_frame_rate") or s.get("r_frame_rate") or "0/1"
+            try:
+                n,d = val.split("/")
+                d = int(d) or 1
+                return float(int(n)/d)
+            except Exception:
+                return 0.0
+        fps = _fps(v)
+
+        # règles
+        if codec != "h264": errors.append(f"codec != h264 (got {codec})")
+        if pix_fmt != "yuv420p": errors.append(f"pix_fmt != yuv420p (got {pix_fmt})")
+        if width != 1080 or height != 1920: errors.append(f"resolution != 1080x1920 (got {width}x{height})")
+        if round(fps) != 30: errors.append(f"fps != 30 (got {fps:.3f})")
+
+        ok = (len(errors) == 0)
+        return jsonify(ok=ok, details={
+            "codec":codec, "pix_fmt":pix_fmt, "width":width, "height":height, "fps":round(fps,3)
+        }, errors=errors)
+    except subprocess.CalledProcessError as e:
+        return jsonify(ok=False, errors=[f"ffprobe failed: {e.output.decode('utf-8','ignore')}"]), 500
+    except Exception as e:
+        return jsonify(ok=False, errors=[str(e)]), 500
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # -------------------- main --------------------
 if __name__ == "__main__":
     app.logger.info(f"Service Account email: {_sa_email()}")
