@@ -1,4 +1,4 @@
-# main.py — API sync + async (jobs) pour création vidéo + pré-encodage
+# main.py — API async + pré-encodage (sans /create-video et sans /test-video)
 import os, json, time, tempfile, logging, shutil, subprocess, traceback, random, re
 from uuid import uuid4
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,6 +22,7 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 KEEP_TMP  = os.getenv("KEEP_TMP", "1") == "1"  # garde les /tmp si 1
 GOOGLE_CREDS_PATH = os.getenv("GOOGLE_CREDS", "/etc/secrets/credentials.json")
+UA = "Mozilla/5.0 (compatible; fusion-bot/1.0)"
 
 app = Flask(__name__)
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
@@ -145,6 +146,103 @@ def _normalize_plan(raw: Any) -> List[Dict[str, Any]]:
         raise ValueError("plan is empty")
     return raw
 
+def _drive_resolve_target_id(file_id: str) -> str:
+    """Si file_id est un raccourci, renvoie shortcutDetails.targetId; sinon renvoie file_id tel quel."""
+    svc = _gdrive_service()
+    meta = svc.files().get(
+        fileId=file_id,
+        fields="id,name,mimeType,shortcutDetails/targetId,parents",
+        supportsAllDrives=True
+    ).execute()
+    if meta.get("mimeType") == "application/vnd.google-apps.shortcut":
+        tgt = (meta.get("shortcutDetails") or {}).get("targetId")
+        if tgt:
+            return tgt
+    return file_id
+
+# ---- détection d'ID Drive dans une URL (view/uc/open/file/d/...) ----
+_drive_id_patterns = [
+    re.compile(r"[?&]id=([a-zA-Z0-9_-]{10,})"),
+    re.compile(r"/file/d/([a-zA-Z0-9_-]{10,})"),
+    re.compile(r"/folders/([a-zA-Z0-9_-]{10,})"),
+]
+
+def _extract_drive_id(url: str) -> Optional[str]:
+    if not url: return None
+    for pat in _drive_id_patterns:
+        m = pat.search(url)
+        if m: return m.group(1)
+    return None
+
+# ---- téléchargement minimal pour ffprobe (Drive ou HTTP) ----
+def _download_for_probe(url: str, out_path: str, req_id: str):
+    """
+    Télécharge le média à 'out_path' pour inspection.
+    - Si c'est un lien Drive (view/uc/file/d/...), on utilise l'API Drive.
+    - Sinon, urllib.request.urlopen (HTTP direct).
+    """
+    try:
+        if ".m3u8" in (url or "").lower():
+            raise RuntimeError("Flux HLS non supporté pour le pré-check strict")
+
+        fid = _extract_drive_id(url)
+        if fid:
+            svc = _gdrive_service()
+            fid = _drive_resolve_target_id(fid)
+            req = svc.files().get_media(fileId=fid, supportsAllDrives=True)
+            with open(out_path, "wb") as f:
+                downloader = MediaIoBaseDownload(f, req)
+                done = False
+                while not done:
+                    _status, done = downloader.next_chunk()
+            return
+
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req) as r, open(out_path, "wb") as f:
+            shutil.copyfileobj(r, f)
+    except Exception as e:
+        app.logger.error(f"[{req_id}] download_for_probe failed url={url}: {e}")
+        raise
+
+# ---- vérification stricte (exact 1080x1920 @ 30 fps, h264 yuv420p) ----
+def _check_local_preencoded_ok(local_path: str, req_id: str) -> Tuple[bool, str]:
+    try:
+        probe = subprocess.check_output(
+            ["ffprobe","-v","error","-print_format","json","-select_streams","v:0",
+             "-show_streams","-show_format", local_path],
+            stderr=subprocess.STDOUT
+        ).decode("utf-8","ignore")
+        info = json.loads(probe)
+        v = next((s for s in info.get("streams",[]) if s.get("codec_type")=="video"), {})
+        if not v:
+            return False, "Aucun flux vidéo"
+
+        codec   = v.get("codec_name")
+        pix_fmt = v.get("pix_fmt")
+        width   = int(v.get("width") or 0)
+        height  = int(v.get("height") or 0)
+
+        def _fps(s):
+            val = s.get("avg_frame_rate") or s.get("r_frame_rate") or "0/1"
+            try:
+                n,d = val.split("/")
+                d = int(d) or 1
+                return float(int(n)/d)
+            except Exception:
+                return 0.0
+        fps = round(_fps(v))
+
+        if codec != "h264":      return False, f"codec={codec}"
+        if pix_fmt != "yuv420p": return False, f"pix_fmt={pix_fmt}"
+        if width != 1080 or height != 1920: return False, f"res={width}x{height}"
+        if fps != 30:            return False, f"fps={fps}"
+
+        return True, "OK"
+    except subprocess.CalledProcessError as e:
+        return False, f"ffprobe failed: {e.output.decode('utf-8','ignore')}"
+    except Exception as e:
+        return False, str(e)
+
 # -------------------- hooks --------------------
 @app.before_request
 def _start():
@@ -162,7 +260,7 @@ def _end(resp):
         pass
     return resp
 
-# -------------------- Health & Debug --------------------
+# -------------------- Health --------------------
 @app.get("/")
 def root():
     return jsonify(ok=True, service="fusion-bot", ts=int(time.time()))
@@ -170,23 +268,6 @@ def root():
 @app.get("/whoami-drive")
 def whoami_drive():
     return jsonify(service_account_email=_sa_email())
-
-def _drive_resolve_target_id(file_id: str) -> str:
-    """
-    Si file_id est un raccourci (application/vnd.google-apps.shortcut),
-    on renvoie shortcutDetails.targetId; sinon on renvoie file_id tel quel.
-    """
-    svc = _gdrive_service()
-    meta = svc.files().get(
-        fileId=file_id,
-        fields="id,name,mimeType,shortcutDetails/targetId,parents",
-        supportsAllDrives=True
-    ).execute()
-    if meta.get("mimeType") == "application/vnd.google-apps.shortcut":
-        tgt = (meta.get("shortcutDetails") or {}).get("targetId")
-        if tgt:
-            return tgt
-    return file_id
 
 # -------------------- PRE-ENCODE (file_id ONLY) --------------------
 @app.post("/pre-encode")
@@ -271,106 +352,6 @@ def pre_encode():
         if not KEEP_TMP:
             shutil.rmtree(workdir, ignore_errors=True)
 
-# -------------------- CREATE-VIDEO (SYNC) --------------------
-@app.post("/create-video")
-def create_video():
-    """
-    multipart/form-data attendu:
-      - output_name (Text)
-      - width, height, fps (Text)
-      - plan (Text) : string JSON (voir Make -> toJSON(...))
-      - audio_file (File) : MP3 voix
-      - global_srt (Text, optionnel)
-      - style, subtitle_mode, word_mode, burn_mode (optionnels)
-      - music_folder_id, music_volume, music_delay (optionnels)
-      - drive_folder_id (Text, optionnel) : upload final
-    """
-    workdir = None
-    try:
-        output_name = request.form["output_name"]
-        width  = _parse_int(request.form.get("width", 1080), 1080)
-        height = _parse_int(request.form.get("height", 1920), 1920)
-        fps    = _parse_int(request.form.get("fps", 30), 30)
-
-        plan_str = request.form["plan"]
-        plan = _normalize_plan(plan_str)
-
-        audio_file = request.files["audio_file"]
-        global_srt = request.form.get("global_srt")
-        style = request.form.get("style") or "default"           # 'default' | 'philo'
-        subtitle_mode = request.form.get("subtitle_mode") or "sentence"  # 'sentence' | 'word'
-        word_mode = request.form.get("word_mode") or "accumulate"        # 'accumulate' | 'replace'
-        burn_mode = request.form.get("burn_mode") or "segment"    # 'segment' | 'none'
-
-        drive_folder_id = request.form.get("drive_folder_id")
-        music_folder_id = request.form.get("music_folder_id")
-        music_volume = _parse_float(request.form.get("music_volume", 0.25), 0.25)
-        music_delay  = _parse_int(request.form.get("music_delay", 0), 0)
-
-        req_id = g.req_id
-        app.logger.info(f"[{req_id}] create-video name={output_name} {width}x{height}@{fps} audio={getattr(audio_file,'filename',None)}")
-
-        try:
-            total_dur = sum(float(max(0.0, (seg.get("duration") or 0))) for seg in plan)
-        except Exception:
-            total_dur = 0.0
-        free_tmp = shutil.disk_usage("/tmp").free // (1024*1024)
-        app.logger.info(f"[{req_id}] preflight tmp: free={free_tmp}MB need≈~{int(total_dur*0.35)}MB")
-
-        workdir = tempfile.mkdtemp(prefix="fusionbot_")
-        debug_dir = os.path.join(workdir, "debug")
-        os.makedirs(debug_dir, exist_ok=True)
-
-        audio_path = os.path.join(workdir, "voice.mp3")
-        audio_file.save(audio_path)
-        audio_size = os.path.getsize(audio_path)
-        audio_dur = _ffprobe_duration(audio_path)
-        app.logger.info(f"[{req_id}] audio path={audio_path} size={audio_size}B dur={audio_dur:.3f}s")
-
-        with open(os.path.join(debug_dir, "plan_input.json"), "w", encoding="utf-8") as f:
-            f.write(json.dumps(plan, ensure_ascii=False, indent=2))
-        if global_srt:
-            with open(os.path.join(debug_dir, "global_srt.srt"), "w", encoding="utf-8") as f:
-                f.write(global_srt)
-
-        music_path, music_start = (None, 0)
-        if music_folder_id:
-            music_path, music_start = _gdrive_pick_and_download_music(music_folder_id, workdir, app.logger, req_id)
-            if music_path:
-                app.logger.info(f"[{req_id}] music picked: {music_path} @ {music_start}s vol={music_volume}")
-
-        final_path, dbg = generate_video(
-            plan=plan,
-            audio_path=audio_path,
-            output_name=output_name,
-            temp_dir=workdir,
-            width=width, height=height, fps=fps,
-            logger=app.logger, req_id=req_id,
-            sub_style=None,            # géré par style
-            style=style,
-            subtitle_mode=subtitle_mode,
-            word_mode=word_mode,
-            global_srt=global_srt,
-            burn_mode=burn_mode,
-            music_path=music_path,
-            music_delay=music_start,
-            music_volume=music_volume
-        )
-
-        resp = {"status":"success","output_path":final_path,"width":width,"height":height,"fps":fps, **dbg}
-        if drive_folder_id:
-            up = _gdrive_upload(final_path, output_name, drive_folder_id, app.logger, req_id)
-            resp.update({"drive_file_id": up.get("id"), "drive_webViewLink": up.get("webViewLink"), "drive_webContentLink": up.get("webContentLink")})
-
-        return jsonify(resp)
-
-    except Exception as e:
-        app.logger.error(f"[{g.req_id}] create-video failed: {e}\n{traceback.format_exc()}")
-        return jsonify(error=str(e)), 500
-    finally:
-        if workdir and not KEEP_TMP:
-            shutil.rmtree(workdir, ignore_errors=True)
-
 # -------------------- CREATE-VIDEO (ASYNC + JOBS) --------------------
 JOBS: Dict[str, Dict[str, Any]] = {}
 JLOCK = Lock()
@@ -395,7 +376,7 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
         style = fields.get("style","default")
         subtitle_mode = fields.get("subtitle_mode","sentence")
         word_mode = fields.get("word_mode","accumulate")
-        burn_mode = fields.get("burn_mode","segment")
+        burn_mode = fields.get("burn_mode","none")  # pas de subs par défaut en async
         global_srt = fields.get("global_srt")
 
         music_path, music_start = (None, 0)
@@ -411,7 +392,8 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
             logger=app.logger, req_id=req_id,
             style=style, subtitle_mode=subtitle_mode, word_mode=word_mode,
             global_srt=global_srt, burn_mode=burn_mode,
-            music_path=music_path, music_delay=music_start, music_volume=float(fields.get("music_volume", 0.25))
+            music_path=music_path, music_delay=music_start, music_volume=float(fields.get("music_volume", 0.25)),
+            strict_preencoded=True     # 🔒 aucun ré-encodage autorisé en async
         )
 
         out = {"status":"success","output_path":final_path,"width":width,"height":height,"fps":fps, **dbg}
@@ -439,6 +421,11 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
 
 @app.post("/create-video-async")
 def create_video_async():
+    """
+    🔒 Pré-check strict : on refuse toute vidéo non pré-encodée au bon format.
+    Champs (multipart/form-data) : output_name, plan (string JSON), audio_file, etc.
+    Par défaut: burn_mode=none (pas de sous-titres) pour éviter tout ré-encodage.
+    """
     jid = request.form.get("job_id") or str(uuid4())
     req_id = request.headers.get("X-Request-ID", str(uuid4()))
     tmp = tempfile.mkdtemp(prefix=f"enqueue_{jid}_")
@@ -451,6 +438,23 @@ def create_video_async():
             audio_bytes = f.read()
 
         plan = _normalize_plan(request.form["plan"])
+
+        # ------ PRÉ-CHECK STRICT SUR TOUS LES SEGMENTS ------
+        for i, seg in enumerate(plan):
+            url = (seg.get("gif_url") or seg.get("url") or seg.get("video_url") or "").strip()
+            if not url:
+                shutil.rmtree(tmp, ignore_errors=True)
+                return jsonify(error="plan_segment_missing_url", detail={"index": i}), 400
+
+            local = os.path.join(tmp, f"probe_{i:03d}.mp4")
+            _download_for_probe(url, local, req_id)  # Drive API ou HTTP direct
+
+            ok, why = _check_local_preencoded_ok(local, req_id)
+            if not ok:
+                shutil.rmtree(tmp, ignore_errors=True)
+                return jsonify(error="Mauvais format, malgré pré-encode", detail={"index": i, "why": why}), 400
+
+        # ------ Enqueue une fois le plan validé ------
         fields = {
             "req_id": req_id,
             "output_name": request.form["output_name"],
@@ -463,7 +467,7 @@ def create_video_async():
             "style": request.form.get("style") or "default",
             "subtitle_mode": request.form.get("subtitle_mode") or "sentence",
             "word_mode": request.form.get("word_mode") or "accumulate",
-            "burn_mode": request.form.get("burn_mode") or "segment",
+            "burn_mode": request.form.get("burn_mode") or "none",  # 🟣 défaut: pas de subs
             "drive_folder_id": request.form.get("drive_folder_id"),
             "music_folder_id": request.form.get("music_folder_id"),
             "music_volume": _parse_float(request.form.get("music_volume", 0.25), 0.25),
@@ -481,6 +485,7 @@ def create_video_async():
         app.logger.error(f"[{req_id}] enqueue failed: {e}\n{traceback.format_exc()}")
         return jsonify(error="enqueue_failed", detail=str(e)), 400
 
+# -------------------- JOBS API --------------------
 @app.get("/jobs/<job_id>")
 def get_job(job_id: str):
     with JLOCK:
@@ -497,70 +502,6 @@ def list_jobs():
             for j in JOBS.values()
         ]
     return jsonify(items)
-
-
-
-@app.post("/test-video")
-def test_video():
-    """
-    multipart/form-data:
-      - file (File) : MP4 à vérifier
-    Réponse: {ok: bool, details:{codec,pix_fmt,width,height,fps}, errors:[...]}
-    """
-    req_id = str(uuid4())
-    tmpdir = tempfile.mkdtemp(prefix="testvid_")
-    errors = []
-    try:
-        if "file" not in request.files:
-            return jsonify(ok=False, errors=["Missing file upload (key=file)"]), 400
-
-        f = request.files["file"]
-        local = os.path.join(tmpdir, f.filename or "video.mp4")
-        f.save(local)
-
-        # ffprobe
-        import json, subprocess
-        probe = subprocess.check_output(
-            ["ffprobe","-v","error","-print_format","json","-select_streams","v:0",
-             "-show_streams","-show_format", local],
-            stderr=subprocess.STDOUT
-        ).decode("utf-8","ignore")
-        info = json.loads(probe)
-        v = next((s for s in info.get("streams",[]) if s.get("codec_type")=="video"), {})
-
-        codec   = v.get("codec_name")
-        pix_fmt = v.get("pix_fmt")
-        width   = int(v.get("width") or 0)
-        height  = int(v.get("height") or 0)
-
-        # fps: priorité avg_frame_rate sinon r_frame_rate
-        def _fps(s):
-            val = s.get("avg_frame_rate") or s.get("r_frame_rate") or "0/1"
-            try:
-                n,d = val.split("/")
-                d = int(d) or 1
-                return float(int(n)/d)
-            except Exception:
-                return 0.0
-        fps = _fps(v)
-
-        # règles
-        if codec != "h264": errors.append(f"codec != h264 (got {codec})")
-        if pix_fmt != "yuv420p": errors.append(f"pix_fmt != yuv420p (got {pix_fmt})")
-        if width != 1080 or height != 1920: errors.append(f"resolution != 1080x1920 (got {width}x{height})")
-        if round(fps) != 30: errors.append(f"fps != 30 (got {fps:.3f})")
-
-        ok = (len(errors) == 0)
-        return jsonify(ok=ok, details={
-            "codec":codec, "pix_fmt":pix_fmt, "width":width, "height":height, "fps":round(fps,3)
-        }, errors=errors)
-    except subprocess.CalledProcessError as e:
-        return jsonify(ok=False, errors=[f"ffprobe failed: {e.output.decode('utf-8','ignore')}"]), 500
-    except Exception as e:
-        return jsonify(ok=False, errors=[str(e)]), 500
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
 
 # -------------------- main --------------------
 if __name__ == "__main__":
