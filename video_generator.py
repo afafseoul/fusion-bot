@@ -1,12 +1,16 @@
-# video_generator.py — PREENCODE STRICT (no re-encode) + ancien pipeline pour le reste
+# video_generator.py — plan "ancien" + pré-check préencodage + NO reformat si déjà OK
 import os, time, shutil, subprocess, logging, urllib.request, json, shlex, re
 from typing import Any, Dict, List, Tuple
 from utils.text_overlay import make_segment_srt, SUB_STYLE_CAPCUT
 
 UA = "Mozilla/5.0 (compatible; RenderBot/1.0)"
-DEFAULT_SUB_STYLE = SUB_STYLE_CAPCUT  # style CapCut
+DEFAULT_SUB_STYLE = SUB_STYLE_CAPCUT
 
-# ---- Style "philo" (on ne l'utilise pas si burn_subs=0, mais on garde la compat) ----
+FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "").strip()
+def _with_threads(cmd: str) -> str:
+    return f"{cmd} -threads {FFMPEG_THREADS}" if FFMPEG_THREADS else cmd
+
+# ---- Style "philo" (conservé mais tu utilises style=default) ----
 SUB_STYLE_PHILO = (
     "Fontname=Arial,Fontsize=42,PrimaryColour=&H00FFFFFF,"
     "OutlineColour=&H00202020,Outline=3,Shadow=0,BorderStyle=1,"
@@ -14,7 +18,9 @@ SUB_STYLE_PHILO = (
 )
 STYLE_SUB_MAP = {"philo": SUB_STYLE_PHILO, "default": DEFAULT_SUB_STYLE, "capcut": DEFAULT_SUB_STYLE}
 
-# -------------------- utils shell/ffprobe --------------------
+# =========================================================
+#                       utils ffmpeg
+# =========================================================
 def _run(cmd: str, logger: logging.Logger, req_id: str):
     logger.info(f"[{req_id}] CMD: {cmd}")
     p = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -24,66 +30,65 @@ def _run(cmd: str, logger: logging.Logger, req_id: str):
 
 def _ffprobe_json(path: str) -> dict:
     try:
-        out = subprocess.check_output([
-            "ffprobe","-v","error","-print_format","json",
-            "-show_format","-show_streams", path
-        ], stderr=subprocess.STDOUT, timeout=10)
+        out = subprocess.check_output(
+            ["ffprobe","-v","error","-print_format","json","-show_format","-show_streams", path],
+            stderr=subprocess.STDOUT, timeout=12
+        )
         return json.loads(out.decode("utf-8","ignore"))
     except Exception:
         return {}
 
-def _fps_from_stream(s: dict) -> float:
-    fr = s.get("avg_frame_rate") or s.get("r_frame_rate") or ""
-    if isinstance(fr, str) and "/" in fr:
-        a,b = fr.split("/",1)
+def _fps_of_stream(s: dict) -> float:
+    for key in ("avg_frame_rate","r_frame_rate"):
+        fr = s.get(key) or ""
+        if isinstance(fr, str) and "/" in fr:
+            try:
+                a,b = fr.split("/"); a=float(a); b=float(b) or 1.0
+                return a/b
+            except Exception: pass
         try:
-            a = float(a); b = float(b); 
-            return 0.0 if b == 0 else a/b
-        except Exception:
-            return 0.0
-    try:
-        return float(fr) if fr else 0.0
-    except Exception:
-        return 0.0
+            return float(fr)
+        except Exception: pass
+    return 0.0
 
-def _probe_video_props(path: str) -> Dict[str, Any]:
+def _probe_props(path: str) -> Dict[str, Any]:
     info = _ffprobe_json(path)
-    out = {
-        "has_video": False, "is_gif": (path.lower().endswith(".gif")),
-        "codec": None, "pix_fmt": None, "w": 0, "h": 0, "fps": 0.0, "duration": 0.0
+    v = next((s for s in info.get("streams",[]) if s.get("codec_type")=="video"), {}) or {}
+    dur = 0.0
+    try: dur = float((info.get("format",{}) or {}).get("duration", 0.0) or 0.0)
+    except Exception: dur = 0.0
+    return {
+        "codec": v.get("codec_name"),
+        "pix_fmt": v.get("pix_fmt"),
+        "width": int(v.get("width") or 0),
+        "height": int(v.get("height") or 0),
+        "fps": _fps_of_stream(v),
+        "duration": max(0.0, dur),
     }
-    fmt = info.get("format") or {}
-    try:
-        out["duration"] = float(fmt.get("duration") or 0.0)
-    except Exception:
-        out["duration"] = 0.0
-    for s in info.get("streams", []):
-        if (s or {}).get("codec_type") == "video":
-            out["has_video"] = True
-            out["codec"]   = s.get("codec_name")
-            out["pix_fmt"] = s.get("pix_fmt")
-            out["w"]       = int(s.get("width") or 0)
-            out["h"]       = int(s.get("height") or 0)
-            out["fps"]     = _fps_from_stream(s)
-            break
-    # gif heuristique
-    fm = (fmt.get("format_name","") or "").lower()
-    if "gif" in fm:
-        out["is_gif"] = True
-    return out
+
+def _format_ok_for_target(props: Dict[str, Any], width: int, height: int, fps: int) -> bool:
+    fps_ok = abs((props.get("fps") or 0) - fps) <= 0.5  # tolère 29.97
+    return (
+        props.get("codec") == "h264" and
+        props.get("pix_fmt") == "yuv420p" and
+        int(props.get("width") or 0) == int(width) and
+        int(props.get("height") or 0) == int(height) and
+        fps_ok
+    )
 
 def _kind(path: str) -> Tuple[bool, bool]:
-    p = _probe_video_props(path)
-    return p["has_video"], p["is_gif"]
+    info = _ffprobe_json(path)
+    fm = (info.get("format",{}) or {}).get("format_name","") or ""
+    has_video = any((s or {}).get("codec_type") == "video" for s in info.get("streams",[]))
+    is_gif = ("gif" in fm.lower()) or path.lower().endswith(".gif")
+    return has_video, is_gif
 
-# -------------------- download --------------------
+# =========================================================
+#                       download simple
+# =========================================================
 def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> str:
-    """
-    Télécharge tel quel (webContentLink Drive OK).
-    Si la réponse est HTML -> on lève une erreur (il faut un lien direct).
-    """
     os.makedirs(os.path.dirname(dst_noext), exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": "https://www.pinterest.com/"})
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=45) as r:
         ct = (r.info().get_content_type() or "").lower()
         if "gif" in ct: ext = ".gif"
@@ -97,42 +102,97 @@ def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> 
         with open(dst, "wb") as f: shutil.copyfileobj(r, f)
     if os.path.getsize(dst) <= 0:
         raise RuntimeError("downloaded file is empty")
-    # anti HTML
-    head = open(dst, "rb").read(512).lower()
-    if b"<html" in head or b"<!doctype html" in head:
-        raise RuntimeError("Downloaded file is not media (got HTML). Lien Drive direct requis.")
+    if dst.endswith(".bin"):
+        head = open(dst, "rb").read(512).lower()
+        if b"<html" in head or b"<!doctype html" in head:
+            raise RuntimeError("Downloaded file is not media (got HTML). Lien Drive direct requis.")
     logger.info(f"[{req_id}] downloaded (HTTP) -> {dst}")
     return dst
 
-# -------------------- PREENCODE STRICT CHECKS --------------------
-def _is_good_preencoded_mp4(path: str, want_w: int, want_h: int, want_fps: int,
-                            logger: logging.Logger, req_id: str) -> Tuple[bool, str, Dict[str, Any]]:
-    props = _probe_video_props(path)
-    logger.info(f"[{req_id}] precheck {path} codec={props['codec']} pix_fmt={props['pix_fmt']} "
-                f"res={props['w']}x{props['h']} fps~{props['fps']:.3f} dur={props['duration']:.3f}")
-    # tolérances très faibles (fps à ±0.05)
-    reasons = []
-    if not props["has_video"]: reasons.append("no_video_stream")
-    if props["codec"] != "h264": reasons.append(f"codec={props['codec']}")
-    if props["pix_fmt"] != "yuv420p": reasons.append(f"pix_fmt={props['pix_fmt']}")
-    if props["w"] != want_w or props["h"] != want_h: reasons.append(f"res={props['w']}x{props['h']}")
-    if abs(props["fps"] - float(want_fps)) > 0.05: reasons.append(f"fps={props['fps']:.3f}")
-    return (len(reasons) == 0), (", ".join(reasons) if reasons else ""), props
+# =========================================================
+#          chemin "STRICT PREENCODÉ" (zéro reformat)
+# =========================================================
+def _trim_copy(src: str, t: float, dst: str, logger, req_id: str):
+    # coupe en copy (rapide, sans ré-encodage)
+    cmd = (
+        "ffmpeg -y -hide_banner -loglevel error "
+        f"-t {t:.3f} -i {shlex.quote(src)} "
+        "-c copy -movflags +faststart "
+        f"{shlex.quote(dst)}"
+    )
+    _run(_with_threads(cmd), logger, req_id)
 
-def _copy_trim(src: str, dst: str, need_dur: float, logger: logging.Logger, req_id: str):
+def _loop_copy_noencode(src: str, need_dur: float, dst: str, logger, req_id: str, src_dur: float):
     """
-    Coupe sans ré-encoder (stream copy) pour respecter la durée demandée.
+    Répète le même fichier en concat COPY pour atteindre need_dur,
+    avec une dernière coupe COPY pour le reliquat.
     """
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    # -t après l'entrée (output option) pour limiter — c'est précis et rapide
-    cmd = ("ffmpeg -y -hide_banner -loglevel error "
-           f"-i {shlex.quote(src)} -t {need_dur:.3f} "
-           "-c copy -movflags +faststart -avoid_negative_ts make_zero "
-           f"{shlex.quote(dst)}")
-    _run(cmd, logger, req_id)
-    logger.info(f"[{req_id}] ✅ trim copy -> {dst}")
+    base = os.path.dirname(dst)
+    lst = os.path.join(base, os.path.basename(dst) + ".list.txt")
+    files: List[str] = []
 
-# -------------------- ENCODE (ancien comportement) --------------------
+    if src_dur <= 0.05:
+        # éviter boucle infinie si média quasi vide
+        _trim_copy(src, need_dur, dst, logger, req_id)
+        return
+
+    n_full = int(need_dur // src_dur)
+    rem = max(0.0, need_dur - n_full * src_dur)
+
+    # fichiers complets
+    for i in range(n_full):
+        files.append(src)
+
+    # reliquat (coupe copy)
+    tmp_rem = None
+    if rem > 1e-3:
+        tmp_rem = os.path.join(base, f"_rem_{int(rem*1000)}.mp4")
+        _trim_copy(src, rem, tmp_rem, logger, req_id)
+        files.append(tmp_rem)
+
+    # filelist
+    with open(lst, "w") as f:
+        for p in files:
+            f.write(f"file '{os.path.abspath(p)}'\n")
+
+    # concat copy (génère timestamps propres)
+    cmd = (
+        "ffmpeg -y -hide_banner -loglevel error "
+        f"-f concat -safe 0 -i {shlex.quote(lst)} "
+        "-fflags +genpts -avoid_negative_ts make_zero "
+        "-c copy -movflags +faststart "
+        f"{shlex.quote(dst)}"
+    )
+    _run(_with_threads(cmd), logger, req_id)
+
+    try:
+        if tmp_rem and os.path.exists(tmp_rem): os.remove(tmp_rem)
+        if os.path.exists(lst): os.remove(lst)
+    except Exception:
+        pass
+
+def _encode_preencoded_copy_or_loop(
+    src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
+    logger: logging.Logger, req_id: str
+):
+    props = _probe_props(src)
+    logger.info(f"[{req_id}] precheck {src} codec={props.get('codec')} pix_fmt={props.get('pix_fmt')} "
+                f"res={props.get('width')}x{props.get('height')} fps~{props.get('fps'):.3f} dur={props.get('duration'):.3f}")
+
+    if not _format_ok_for_target(props, width, height, fps):
+        raise RuntimeError("Mauvais format, malgré pré-encodage")
+
+    src_dur = float(props.get("duration") or 0.0)
+    if need_dur <= src_dur + 1e-3:
+        _trim_copy(src, need_dur, dst, logger, req_id)
+        logger.info(f"[{req_id}] ✅ copy-trim (no reformat) -> {dst}")
+    else:
+        _loop_copy_noencode(src, need_dur, dst, logger, req_id, src_dur)
+        logger.info(f"[{req_id}] ✅ loop+concat (no reformat) -> {dst}")
+
+# =========================================================
+#       ancien encode (utilisé si subs/effets → ré-encode)
+# =========================================================
 def _vf_for_style(width: int, height: int, fps: int, style_key: str) -> str:
     sk = (style_key or "default").lower().strip()
     if sk != "philo":
@@ -147,11 +207,12 @@ def _vf_for_style(width: int, height: int, fps: int, style_key: str) -> str:
         f"fps={fps}"
     )
 
-def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
-                    logger: logging.Logger, req_id: str,
-                    subs_path: str = None, sub_style: str = DEFAULT_SUB_STYLE,
-                    style_key: str = "default"):
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
+def _encode_uniform_old(
+    src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
+    logger: logging.Logger, req_id: str,
+    subs_path: str = None, sub_style: str = DEFAULT_SUB_STYLE,
+    style_key: str = "default"
+):
     vf = _vf_for_style(width, height, fps, style_key)
     if subs_path:
         vf = f"{vf},subtitles={shlex.quote(subs_path)}:force_style='{sub_style}'"
@@ -163,8 +224,8 @@ def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_
     elif src_low.endswith(".gif"):
         in_flags = f'-ignore_loop 0 -t {need_dur:.3f} -i {shlex.quote(src)}'
     else:
-        # ancien comportement: on boucle la source si besoin
         in_flags = f'-stream_loop -1 -t {need_dur:.3f} -i {shlex.quote(src)}'
+
     cmd = (
         "ffmpeg -y -hide_banner -loglevel error "
         f"{in_flags} "
@@ -173,20 +234,24 @@ def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_
         "-movflags +faststart -video_track_timescale 90000 "
         f"{shlex.quote(dst)}"
     )
-    _run(cmd, logger, req_id)
+    _run(_with_threads(cmd), logger, req_id)
 
-# -------------------- concat / audio (inchangé) --------------------
+# =========================================================
+#            concat vidéo + audio/mix (comme avant)
+# =========================================================
 def _concat_copy_strict(parts: List[str], out_path: str, logger: logging.Logger, req_id: str) -> str:
     list_path = out_path + ".txt"
     with open(list_path, "w") as f:
         for p in parts: f.write(f"file '{os.path.abspath(p)}'\n")
     cmd = ("ffmpeg -y -hide_banner -loglevel error "
            f"-f concat -safe 0 -i {shlex.quote(list_path)} "
-           "-fflags +genpts -avoid_negative_ts make_zero -c copy -movflags +faststart "
+           "-fflags +genpts -avoid_negative_ts make_zero "
+           "-c copy -movflags +faststart "
            f"{shlex.quote(out_path)}")
     try:
-        _run(cmd, logger, req_id); return "concat_copy"
+        _run(_with_threads(cmd), logger, req_id); return "concat_copy"
     except Exception:
+        # fallback filtre (rare)
         inputs = " ".join(f"-i {shlex.quote(p)}" for p in parts)
         n = len(parts); maps = "".join(f"[{i}:v:0]" for i in range(n))
         cmd2 = (f"ffmpeg -y -hide_banner -loglevel error {inputs} "
@@ -195,7 +260,7 @@ def _concat_copy_strict(parts: List[str], out_path: str, logger: logging.Logger,
                 "-pix_fmt yuv420p -movflags +faststart -r 30 "
                 "-video_track_timescale 90000 "
                 f"{shlex.quote(out_path)}")
-        _run(cmd2, logger, req_id); return "concat_filter"
+        _run(_with_threads(cmd2), logger, req_id); return "concat_filter"
 
 def _mux_audio(video_path: str, audio_path: str, out_path: str, logger: logging.Logger, req_id: str):
     cmd = ("ffmpeg -y -hide_banner -loglevel error "
@@ -203,7 +268,7 @@ def _mux_audio(video_path: str, audio_path: str, out_path: str, logger: logging.
            "-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k "
            "-shortest -movflags +faststart "
            f"{shlex.quote(out_path)}")
-    _run(cmd, logger, req_id)
+    _run(_with_threads(cmd), logger, req_id)
 
 def _mix_voice_with_music(voice_path: str, music_path: str, start_at_sec: int,
                           out_audio_path: str, logger: logging.Logger, req_id: str,
@@ -218,38 +283,33 @@ def _mix_voice_with_music(voice_path: str, music_path: str, start_at_sec: int,
         "-map \"[a]\" -c:a aac -b:a 192k "
         f"{shlex.quote(out_audio_path)}"
     )
-    _run(cmd, logger, req_id)
+    _run(_with_threads(cmd), logger, req_id)
 
-# ---- SRT mot par mot (local au segment 0..dur) ----
+# ---- SRT mot par mot (on garde pour plus tard) ----
 def _sec_to_ts(t: float) -> str:
-    t = max(0.0, float(t))
-    ms = int(round(t * 1000))
-    h = ms // 3600000; ms -= h*3600000
-    m = ms // 60000;   ms -= m*60000
-    s = ms // 1000;    ms -= s*1000
+    t = max(0.0, float(t)); ms = int(round(t*1000))
+    h = ms//3600000; ms-=h*3600000
+    m = ms//60000;   ms-=m*60000
+    s = ms//1000;    ms-=s*1000
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 def _make_word_srt(text: str, dur: float, out_path: str, mode: str = "accumulate"):
     txt = (text or "").strip()
     if not txt or dur <= 0:
-        open(out_path, "w", encoding="utf-8").write(""); return
+        open(out_path,"w",encoding="utf-8").write(""); return
     words = re.findall(r"\S+", txt)
     if not words:
-        open(out_path, "w", encoding="utf-8").write(""); return
-    n = len(words)
-    step = max(0.08, dur / n)
-    t = 0.0
-    blocks = []
-    for i, _w in enumerate(words):
-        t1 = t
-        t2 = min(dur, t + step)
-        payload = (" ".join(words[:i+1]) if mode == "accumulate" else _w)
-        blocks.append(f"{i+1}\n{_sec_to_ts(t1)} --> {_sec_to_ts(t2)}\n{payload}\n")
-        t = t2
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(blocks))
+        open(out_path,"w",encoding="utf-8").write(""); return
+    n = len(words); step = max(0.08, dur/n); t = 0.0; blocks=[]
+    for i,_w in enumerate(words):
+        t1=t; t2=min(dur, t+step)
+        payload = (" ".join(words[:i+1]) if mode=="accumulate" else _w)
+        blocks.append(f"{i+1}\n{_sec_to_ts(t1)} --> {_sec_to_ts(t2)}\n{payload}\n"); t=t2
+    with open(out_path,"w",encoding="utf-8") as f: f.write("\n".join(blocks))
 
-# -------------------- generate_video --------------------
+# =========================================================
+#                    GENERATE VIDEO (plan)
+# =========================================================
 def generate_video(
     plan: List[Dict[str, Any]],
     audio_path: str,
@@ -261,9 +321,9 @@ def generate_video(
     logger: logging.Logger,
     req_id: str,
     sub_style: str = DEFAULT_SUB_STYLE,
-    style: str = "default",             # 'default' | 'philo'
-    subtitle_mode: str = "sentence",    # 'sentence' | 'word'
-    word_mode: str = "accumulate",      # 'accumulate' | 'replace'
+    style: str = "default",
+    subtitle_mode: str = "sentence",
+    word_mode: str = "accumulate",
     global_srt: str = None,
     burn_mode: str = None,
     music_path: str = None,
@@ -271,10 +331,6 @@ def generate_video(
     music_volume: float = 0.25,
     **kwargs
 ):
-    """
-    Règle: si pas de sous-titres gravés ET style=default -> PREENCODE STRICT (stream copy only).
-    Sinon -> ancien pipeline d'encodage (comme avant).
-    """
     style_key = (style or "default").lower().strip()
     if style_key in STYLE_SUB_MAP:
         sub_style = STYLE_SUB_MAP[style_key]
@@ -282,30 +338,23 @@ def generate_video(
     mode_burn = (burn_mode or "segment").lower().strip()
     burn_segments = (mode_burn != "none")
 
-    # ⇩⇩ PREENCODE STRICT si VRAIMENT rien à graver
-    preencode_strict = (not burn_segments) and (style_key == "default")
-
     parts: List[str] = []
     has_seg_times = burn_segments and any((seg.get("subtitles") for seg in plan))
     t_running = 0.0
 
     for i, seg in enumerate(plan):
         url = seg.get("gif_url") or seg.get("url") or seg.get("video_url")
-        if not url:
-            raise ValueError(f"plan[{i}] missing url/gif_url")
-        try:
-            dur = float(seg.get("duration") or 0.0)
-        except Exception:
-            dur = 0.0
-        if dur <= 0.0:
-            dur = 0.5
+        if not url: raise ValueError(f"plan[{i}] missing url/gif_url")
+        try: dur = float(seg.get("duration") or 0.0)
+        except Exception: dur = 0.0
+        if dur <= 0.0: dur = 0.5
         start = float(seg.get("start_time")) if seg.get("start_time") is not None else t_running
         txt = (seg.get("text") or "").strip()
         logger.info(f"[{req_id}] seg#{i} start={start:.3f} dur={dur:.3f} url={url}")
 
         # source
         if url.lower().startswith("http") and ".m3u8" in url.lower():
-            src_for_encode = url
+            src_for_encode = url  # rare
         else:
             base = os.path.join(temp_dir, f"src_{int(time.time()*1000)}_{i}")
             src_for_encode = _download(url, base, logger, req_id)
@@ -313,7 +362,7 @@ def generate_video(
             if not (has_video or is_gif):
                 raise RuntimeError("Downloaded file is not media (got HTML). Lien Drive direct requis.")
 
-        # SRT segment (uniquement si burn actif)
+        # SRT segment (désactivé si burn_mode='none')
         seg_srt = None
         if burn_segments:
             if subtitle_mode.lower().strip() == "word" and txt:
@@ -323,24 +372,19 @@ def generate_video(
                 seg_srt = os.path.join(temp_dir, f"seg_{i:03d}.srt")
                 make_segment_srt(seg.get("subtitles"), txt, start, dur, seg_srt)
 
-        # --- ENCODAGE / COPIE ---
+        # production du morceau
         part_path = os.path.join(temp_dir, f"part_{i:03d}.mp4")
-        if preencode_strict and not seg_srt and src_for_encode.lower().endswith(".mp4"):
-            ok, why, props = _is_good_preencoded_mp4(src_for_encode, width, height, fps, logger, req_id)
-            if not ok:
-                raise RuntimeError(f"Mauvais format, malgré pré-encodage: {why}")
-            # Vérifie que la durée demandée tient dans la source (sinon on refuse)
-            # (tolérance +50 ms)
-            if dur > (props.get("duration") or 0.0) + 0.05:
-                raise RuntimeError(f"Mauvais format, malgré pré-encodage: dur_source={props.get('duration'):.3f}s < dur_demande={dur:.3f}s")
-            _copy_trim(src_for_encode, part_path, dur, logger, req_id)
+
+        # >>> chemin "préencodé strict" = aucun reformat si pas de subs/effets
+        if not seg_srt and style_key == "default":
+            _encode_preencoded_copy_or_loop(
+                src_for_encode, part_path, width, height, fps, dur, logger, req_id
+            )
         else:
-            # ancien pipeline
-            _encode_uniform(
+            # cas avec sous-titres/effets → ancien encode
+            _encode_uniform_old(
                 src_for_encode, part_path, width, height, fps, dur,
-                logger, req_id,
-                subs_path=seg_srt, sub_style=sub_style,
-                style_key=style_key
+                logger, req_id, subs_path=seg_srt, sub_style=sub_style, style_key=style_key
             )
 
         parts.append(part_path)
@@ -350,7 +394,7 @@ def generate_video(
     if not parts:
         raise ValueError("empty parts")
 
-    # concat (copy) -> préparation audio
+    # concat vidéo (copy) puis audio/mix
     video_only = os.path.join(temp_dir, "_video.mp4")
     concat_mode = _concat_copy_strict(parts, video_only, logger, req_id)
 
@@ -358,13 +402,9 @@ def generate_video(
     if music_path:
         mixed = os.path.join(temp_dir, "voice_mix.m4a")
         _mix_voice_with_music(
-            voice_path=audio_path,
-            music_path=music_path,
-            start_at_sec=int(music_delay),
-            out_audio_path=mixed,
-            logger=logger,
-            req_id=req_id,
-            music_volume=float(music_volume),
+            voice_path=audio_path, music_path=music_path,
+            start_at_sec=int(music_delay), out_audio_path=mixed,
+            logger=logger, req_id=req_id, music_volume=float(music_volume),
         )
         audio_for_mux = mixed
 
@@ -373,6 +413,8 @@ def generate_video(
 
     debug = {
         "mode": concat_mode,
+        "subs": ("burned_per_segment" if has_seg_times or subtitle_mode.lower()=="word"
+                 else ("none" if not burn_segments else "no_times")),
         "items": len(parts),
         "burn_mode": mode_burn,
         "style": style_key,
@@ -381,6 +423,6 @@ def generate_video(
         "music": bool(music_path),
         "music_start_at": int(music_delay) if music_path else 0,
         "music_volume": float(music_volume) if music_path else 0.0,
-        "preencode_strict": bool(preencode_strict),
+        "strict_preencoded_path": (not burn_segments and style_key=="default"),
     }
     return out_path, debug
