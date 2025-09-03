@@ -16,40 +16,101 @@ STYLE_SUB_MAP = {"philo": SUB_STYLE_PHILO, "default": DEFAULT_SUB_STYLE, "capcut
 
 FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "").strip()
 
-# -------------------- helpers --------------------
+# -------------------- helpers shell & probe --------------------
 def _run(cmd: str, logger: logging.Logger, req_id: str):
-    if FFMPEG_THREADS: cmd = f"{cmd} -threads {FFMPEG_THREADS}"
+    if FFMPEG_THREADS:
+        cmd = f"{cmd} -threads {FFMPEG_THREADS}"
     logger.info(f"[{req_id}] CMD: {cmd}")
     p = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     logger.info(f"[{req_id}] STDERR: {p.stdout}")
-    if p.returncode != 0: raise RuntimeError(f"Command failed: {cmd}")
+    if p.returncode != 0:
+        raise RuntimeError(f"Command failed: {cmd}")
 
 def _ffprobe_json(path: str) -> dict:
     try:
-        out = subprocess.check_output(["ffprobe","-v","error","-print_format","json","-show_format","-show_streams", path],
-            stderr=subprocess.STDOUT, timeout=10)
+        out = subprocess.check_output(
+            ["ffprobe","-v","error","-print_format","json","-show_format","-show_streams", path],
+            stderr=subprocess.STDOUT, timeout=10
+        )
         return json.loads(out.decode("utf-8","ignore"))
-    except Exception: return {}
+    except Exception:
+        return {}
+
+def _fps_from_stream(s: dict) -> float:
+    val = s.get("avg_frame_rate") or s.get("r_frame_rate") or "0/1"
+    try:
+        n, d = val.split("/")
+        n = int(n); d = int(d) or 1
+        return float(n)/d
+    except Exception:
+        return 0.0
 
 def _is_good_mp4(path: str, logger, req_id: str) -> bool:
+    """
+    Tolérant (<=1080x1920). Le strict (exact 1080x1920@30 h264/yuv420p) est contrôlé en amont par /create-video-async.
+    """
     info = _ffprobe_json(path)
     for s in info.get("streams", []):
         if s.get("codec_type") == "video":
             codec, pix_fmt = s.get("codec_name"), s.get("pix_fmt")
             w, h = s.get("width", 0), s.get("height", 0)
-            # format "pré-encodé" acceptable (on tolère <= 1080x1920 ici, le strict est géré en amont)
             logger.info(f"[{req_id}] check {path} codec={codec} pix_fmt={pix_fmt} res={w}x{h}")
             return codec == "h264" and pix_fmt == "yuv420p" and w <= 1080 and h <= 1920
     return False
 
-# -------------------- encode --------------------
+# -------------------- download & kind --------------------
+def _guess_ext_from_url_or_ct(url: str, content_type: str) -> str:
+    if content_type:
+        ct = content_type.lower()
+        if "mp4" in ct: return ".mp4"
+        if "gif" in ct: return ".gif"
+        if "quicktime" in ct or "mov" in ct: return ".mov"
+        if "webm" in ct: return ".webm"
+    u = (url or "").lower()
+    for ext in (".mp4",".gif",".mov",".webm",".m4v"):
+        if ext in u:
+            return ext
+    return ".mp4"  # fallback raisonnable
+
+def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> str:
+    """
+    Télécharge URL (Drive uc?id=..., webContentLink, Giphy, etc.) et renvoie le chemin final avec extension.
+    """
+    os.makedirs(os.path.dirname(dst_noext), exist_ok=True)
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": "https://example.com"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        ct = r.headers.get("Content-Type") or ""
+        ext = _guess_ext_from_url_or_ct(url, ct)
+        dst = dst_noext + ext
+        with open(dst, "wb") as f:
+            shutil.copyfileobj(r, f)
+    logger.info(f"[{req_id}] downloaded -> {dst}")
+    return dst
+
+def _kind(path: str) -> Tuple[bool, bool]:
+    """
+    Retourne (has_video, is_gif) via ffprobe + extension.
+    """
+    try:
+        out = subprocess.check_output(
+            ["ffprobe","-v","error","-select_streams","v:0","-show_streams","-of","json", path],
+            stderr=subprocess.STDOUT, timeout=10
+        ).decode("utf-8","ignore")
+        info = json.loads(out)
+        has_video = any((s.get("codec_type") == "video") for s in info.get("streams", []))
+    except Exception:
+        has_video = False
+    is_gif = path.lower().endswith(".gif")
+    return has_video, is_gif
+
+# -------------------- encode (fallback) --------------------
 def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
                     logger: logging.Logger, req_id: str,
                     subs_path: str = None, sub_style: str = DEFAULT_SUB_STYLE,
                     style_key: str = "default",
                     strict: bool = False):
     """
-    - Si strict=True : aucune ré-encodage autorisé (copie pure) dès lors qu'il n'y a PAS de sous-titres à graver.
+    - Si strict=True : aucun ré-encodage autorisé (copie pure) dès lors qu'il n'y a PAS de sous-titres à graver.
       -> Si le fichier n'est pas un MP4 'bon format', on lève une erreur.
     - Si strict=False : comportement historique (ré-encode si nécessaire).
     """
@@ -75,6 +136,80 @@ def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_
            "-c:v libx264 -preset superfast -crf 26 "
            "-movflags +faststart -video_track_timescale 90000 "
            f"{shlex.quote(dst)}")
+    _run(cmd, logger, req_id)
+
+# -------------------- word-by-word SRT (local) --------------------
+def _fmt_ts(t: float) -> str:
+    ms = int(round(t * 1000.0))
+    h = ms // 3600000
+    m = (ms % 3600000) // 60000
+    s = (ms % 60000) // 1000
+    ms = ms % 1000
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def _make_word_srt(text: str, duration: float, srt_path: str, mode: str = "accumulate"):
+    words = re.findall(r"\S+", text or "")
+    if not words:
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write("1\n00:00:00,000 --> " + _fmt_ts(max(0.1, duration)) + "\n" + (text or "") + "\n")
+        return
+    step = max(duration / len(words), 0.05)
+    with open(srt_path, "w", encoding="utf-8") as f:
+        t0 = 0.0
+        for i, w in enumerate(words):
+            t1 = duration if i == len(words) - 1 else (i + 1) * step
+            if mode == "replace":
+                line = w
+            else:
+                line = " ".join(words[:i+1])
+            f.write(f"{i+1}\n{_fmt_ts(t0)} --> { _fmt_ts(t1) }\n{line}\n\n")
+            t0 = t1
+
+# -------------------- concat (copy) --------------------
+def _concat_copy_strict(parts: List[str], out_path: str, logger: logging.Logger, req_id: str) -> str:
+    """
+    Concatène des MP4 homogènes en COPY via demuxer concat.
+    """
+    lst = out_path + ".txt"
+    with open(lst, "w") as f:
+        for p in parts:
+            f.write(f"file '{p}'\n")
+    cmd = (
+        "ffmpeg -y -hide_banner -loglevel error "
+        f"-f concat -safe 0 -i {shlex.quote(lst)} "
+        "-c copy -movflags +faststart "
+        f"{shlex.quote(out_path)}"
+    )
+    _run(cmd, logger, req_id)
+    return "concat_copy"
+
+# -------------------- mix/mux audio --------------------
+def _mix_voice_with_music(voice_path: str, music_path: str, start_at_sec: int,
+                          out_audio_path: str, logger: logging.Logger, req_id: str,
+                          music_volume: float = 0.25):
+    """
+    Mixe la voix + musique (démarrage musique à start_at_sec, volume atténué).
+    Sortie AAC (m4a/mp4).
+    """
+    cmd = (
+        "ffmpeg -y -hide_banner -loglevel error "
+        f"-i {shlex.quote(voice_path)} "
+        f"-ss {int(start_at_sec)} -i {shlex.quote(music_path)} "
+        f"-filter_complex [1:a]volume={music_volume}[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2 "
+        "-c:a aac -b:a 192k "
+        f"{shlex.quote(out_audio_path)}"
+    )
+    _run(cmd, logger, req_id)
+
+def _mux_audio(video_path: str, audio_path: str, out_path: str,
+               logger: logging.Logger, req_id: str):
+    cmd = (
+        "ffmpeg -y -hide_banner -loglevel error "
+        f"-i {shlex.quote(video_path)} -i {shlex.quote(audio_path)} "
+        "-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k "
+        "-movflags +faststart "
+        f"{shlex.quote(out_path)}"
+    )
     _run(cmd, logger, req_id)
 
 # -------------------- generate_video --------------------
@@ -210,6 +345,3 @@ def generate_video(
         "strict_preencoded": bool(strict_preencoded),
     }
     return out_path, debug
-
-# --- Les helpers _download, _kind, _concat_copy_strict, _mix_voice_with_music, _mux_audio, _make_word_srt
-#     restent inchangés dans le bas du fichier (tes versions actuelles).
