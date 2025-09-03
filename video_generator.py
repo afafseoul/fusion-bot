@@ -37,6 +37,7 @@ def _is_good_mp4(path: str, logger, req_id: str) -> bool:
         if s.get("codec_type") == "video":
             codec, pix_fmt = s.get("codec_name"), s.get("pix_fmt")
             w, h = s.get("width", 0), s.get("height", 0)
+            # format "pré-encodé" acceptable (on tolère <= 1080x1920 ici, le strict est géré en amont)
             logger.info(f"[{req_id}] check {path} codec={codec} pix_fmt={pix_fmt} res={w}x{h}")
             return codec == "h264" and pix_fmt == "yuv420p" and w <= 1080 and h <= 1920
     return False
@@ -45,13 +46,23 @@ def _is_good_mp4(path: str, logger, req_id: str) -> bool:
 def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
                     logger: logging.Logger, req_id: str,
                     subs_path: str = None, sub_style: str = DEFAULT_SUB_STYLE,
-                    style_key: str = "default"):
+                    style_key: str = "default",
+                    strict: bool = False):
+    """
+    - Si strict=True : aucune ré-encodage autorisé (copie pure) dès lors qu'il n'y a PAS de sous-titres à graver.
+      -> Si le fichier n'est pas un MP4 'bon format', on lève une erreur.
+    - Si strict=False : comportement historique (ré-encode si nécessaire).
+    """
     os.makedirs(os.path.dirname(dst), exist_ok=True)
 
     if src.lower().endswith(".mp4") and _is_good_mp4(src, logger, req_id) and not subs_path:
         shutil.copy2(src, dst)
         logger.info(f"[{req_id}] ✅ skip re-encode (déjà bon format) -> {dst}")
         return
+
+    if strict and not subs_path:
+        # En mode strict (async + pas de subs), on ne doit jamais réencoder.
+        raise RuntimeError("Mauvais format, malgré pré-encode")
 
     base_vf = f"scale={width}:{height}:force_original_aspect_ratio=decrease," \
               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,fps={fps}"
@@ -67,7 +78,6 @@ def _encode_uniform(src: str, dst: str, width: int, height: int, fps: int, need_
     _run(cmd, logger, req_id)
 
 # -------------------- generate_video --------------------
-
 def generate_video(
     plan: List[Dict[str, Any]],
     audio_path: str,
@@ -90,6 +100,7 @@ def generate_video(
     music_path: str = None,
     music_delay: int = 0,       # coupe au début de la musique (ex: @55 => on démarre à 55s)
     music_volume: float = 0.25,
+    strict_preencoded: bool = False,    # 🔒 si True : zéro ré-encodage autorisé (copie only)
     **kwargs
 ):
     """
@@ -154,7 +165,8 @@ def generate_video(
             src_for_encode, part_path, width, height, fps, dur,
             logger, req_id,
             subs_path=seg_srt, sub_style=sub_style,
-            style_key=style_key
+            style_key=style_key,
+            strict=strict_preencoded and not seg_srt  # strict seulement s'il n'y a PAS de subs à graver
         )
         parts.append(part_path)
         if seg.get("start_time") is None:
@@ -195,5 +207,9 @@ def generate_video(
         "music": bool(music_path),
         "music_start_at": int(music_delay) if music_path else 0,
         "music_volume": float(music_volume) if music_path else 0.0,
+        "strict_preencoded": bool(strict_preencoded),
     }
     return out_path, debug
+
+# --- Les helpers _download, _kind, _concat_copy_strict, _mix_voice_with_music, _mux_audio, _make_word_srt
+#     restent inchangés dans le bas du fichier (tes versions actuelles).
