@@ -1,6 +1,8 @@
 # video_generator.py — plan "ancien" + pré-check préencodage + NO reformat si déjà OK
 import os, time, shutil, subprocess, logging, urllib.request, json, shlex, re
 from typing import Any, Dict, List, Tuple
+FFMPEG_FILTER_THREADS = os.getenv("FFMPEG_FILTER_THREADS", "1").strip()
+
 
 from utils.text_overlay import make_segment_srt, SUB_STYLE_CAPCUT
 
@@ -190,32 +192,20 @@ def _encode_preencoded_copy_or_loop(
 #       ancien encode (utilisé si subs/effets → ré-encode)
 # =========================================================
 def _vf_for_style(width: int, height: int, fps: int, style_key: str) -> str:
-    """
-    default : scale+pad plein cadre (hérité, utilisé seulement si on DOIT réencoder)
-    philo   : CROP centré au carré, puis échelle vers un carré plus petit (inner),
-              puis PAD au canvas 1080x1920. (Rognage, pas “shrink” du contenu global).
-    """
     sk = (style_key or "default").lower().strip()
-
     if sk != "philo":
-        return (
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"fps={fps}"
-        )
+        return f"scale={width}:{height}:force_original_aspect_ratio=decrease," \
+               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,fps={fps}"
 
-    # Taille du carré intérieur (ex: ~0.80 du plus petit côté) + possibilité d’ajuster
-    inner = int(min(width, height) * float(os.getenv("PHILO_INNER_RATIO", "0.80")))
-    inner = max(200, min(inner, min(width, height)))
-
-    # Coins arrondis : on le fera plus tard via un mask RGBA (crochet prêt ici)
-    # Pour l’instant: crop carré centré -> scale inner -> pad sur 1080x1920
+    # carré centré + resize doux + pad vertical 1080x1920
+    inner = int(min(width, height) * 0.78)  # 842 pour 1080x1920
     return (
         "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
-        f"scale={inner}:{inner}:flags=lanczos,"
+        f"scale={inner}:{inner}:flags=bicubic,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
         f"fps={fps}"
     )
+
 
 def _encode_uniform_old(
     src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
