@@ -1,6 +1,7 @@
 # video_generator.py — plan "ancien" + pré-check préencodage + NO reformat si déjà OK
 import os, time, shutil, subprocess, logging, urllib.request, json, shlex, re
 from typing import Any, Dict, List, Tuple
+
 from utils.text_overlay import make_segment_srt, SUB_STYLE_CAPCUT
 
 UA = "Mozilla/5.0 (compatible; RenderBot/1.0)"
@@ -10,7 +11,7 @@ FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "").strip()
 def _with_threads(cmd: str) -> str:
     return f"{cmd} -threads {FFMPEG_THREADS}" if FFMPEG_THREADS else cmd
 
-# ---- Style "philo" (conservé mais tu utilises style=default) ----
+# ---- Styles de sous-titres (tu peux les faire évoluer quand tu réactiveras les subs)
 SUB_STYLE_PHILO = (
     "Fontname=Arial,Fontsize=42,PrimaryColour=&H00FFFFFF,"
     "OutlineColour=&H00202020,Outline=3,Shadow=0,BorderStyle=1,"
@@ -45,10 +46,12 @@ def _fps_of_stream(s: dict) -> float:
             try:
                 a,b = fr.split("/"); a=float(a); b=float(b) or 1.0
                 return a/b
-            except Exception: pass
+            except Exception:
+                pass
         try:
             return float(fr)
-        except Exception: pass
+        except Exception:
+            pass
     return 0.0
 
 def _probe_props(path: str) -> Dict[str, Any]:
@@ -67,7 +70,7 @@ def _probe_props(path: str) -> Dict[str, Any]:
     }
 
 def _format_ok_for_target(props: Dict[str, Any], width: int, height: int, fps: int) -> bool:
-    fps_ok = abs((props.get("fps") or 0) - fps) <= 0.5  # tolère 29.97
+    fps_ok = abs((props.get("fps") or 0) - fps) <= 0.6  # tolère 29.97
     return (
         props.get("codec") == "h264" and
         props.get("pix_fmt") == "yuv420p" and
@@ -113,7 +116,6 @@ def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> 
 #          chemin "STRICT PREENCODÉ" (zéro reformat)
 # =========================================================
 def _trim_copy(src: str, t: float, dst: str, logger, req_id: str):
-    # coupe en copy (rapide, sans ré-encodage)
     cmd = (
         "ffmpeg -y -hide_banner -loglevel error "
         f"-t {t:.3f} -i {shlex.quote(src)} "
@@ -123,39 +125,30 @@ def _trim_copy(src: str, t: float, dst: str, logger, req_id: str):
     _run(_with_threads(cmd), logger, req_id)
 
 def _loop_copy_noencode(src: str, need_dur: float, dst: str, logger, req_id: str, src_dur: float):
-    """
-    Répète le même fichier en concat COPY pour atteindre need_dur,
-    avec une dernière coupe COPY pour le reliquat.
-    """
     base = os.path.dirname(dst)
     lst = os.path.join(base, os.path.basename(dst) + ".list.txt")
     files: List[str] = []
 
     if src_dur <= 0.05:
-        # éviter boucle infinie si média quasi vide
         _trim_copy(src, need_dur, dst, logger, req_id)
         return
 
     n_full = int(need_dur // src_dur)
     rem = max(0.0, need_dur - n_full * src_dur)
 
-    # fichiers complets
-    for i in range(n_full):
+    for _ in range(n_full):
         files.append(src)
 
-    # reliquat (coupe copy)
     tmp_rem = None
     if rem > 1e-3:
         tmp_rem = os.path.join(base, f"_rem_{int(rem*1000)}.mp4")
         _trim_copy(src, rem, tmp_rem, logger, req_id)
         files.append(tmp_rem)
 
-    # filelist
     with open(lst, "w") as f:
         for p in files:
             f.write(f"file '{os.path.abspath(p)}'\n")
 
-    # concat copy (génère timestamps propres)
     cmd = (
         "ffmpeg -y -hide_banner -loglevel error "
         f"-f concat -safe 0 -i {shlex.quote(lst)} "
@@ -176,8 +169,11 @@ def _encode_preencoded_copy_or_loop(
     logger: logging.Logger, req_id: str
 ):
     props = _probe_props(src)
-    logger.info(f"[{req_id}] precheck {src} codec={props.get('codec')} pix_fmt={props.get('pix_fmt')} "
-                f"res={props.get('width')}x{props.get('height')} fps~{props.get('fps'):.3f} dur={props.get('duration'):.3f}")
+    logger.info(
+        f"[{req_id}] precheck {os.path.basename(src)} "
+        f"codec={props.get('codec')} pix_fmt={props.get('pix_fmt')} "
+        f"res={props.get('width')}x{props.get('height')} fps~{props.get('fps'):.3f} dur={props.get('duration'):.3f}"
+    )
 
     if not _format_ok_for_target(props, width, height, fps):
         raise RuntimeError("Mauvais format, malgré pré-encodage")
@@ -194,15 +190,29 @@ def _encode_preencoded_copy_or_loop(
 #       ancien encode (utilisé si subs/effets → ré-encode)
 # =========================================================
 def _vf_for_style(width: int, height: int, fps: int, style_key: str) -> str:
+    """
+    default : scale+pad plein cadre (hérité, utilisé seulement si on DOIT réencoder)
+    philo   : CROP centré au carré, puis échelle vers un carré plus petit (inner),
+              puis PAD au canvas 1080x1920. (Rognage, pas “shrink” du contenu global).
+    """
     sk = (style_key or "default").lower().strip()
+
     if sk != "philo":
-        return f"scale={width}:{height}:force_original_aspect_ratio=decrease," \
-               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,fps={fps}"
-    inner = int(min(width, height) * 0.78)
+        return (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
+            f"fps={fps}"
+        )
+
+    # Taille du carré intérieur (ex: ~0.80 du plus petit côté) + possibilité d’ajuster
+    inner = int(min(width, height) * float(os.getenv("PHILO_INNER_RATIO", "0.80")))
+    inner = max(200, min(inner, min(width, height)))
+
+    # Coins arrondis : on le fera plus tard via un mask RGBA (crochet prêt ici)
+    # Pour l’instant: crop carré centré -> scale inner -> pad sur 1080x1920
     return (
-        f"scale={inner}:{inner}:force_original_aspect_ratio=decrease,"
-        f"pad={inner}:{inner}:(ow-iw)/2:(oh-ih)/2:black,"
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
+        f"scale={inner}:{inner}:flags=lanczos,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
         f"fps={fps}"
     )
@@ -215,7 +225,9 @@ def _encode_uniform_old(
 ):
     vf = _vf_for_style(width, height, fps, style_key)
     if subs_path:
-        vf = f"{vf},subtitles={shlex.quote(subs_path)}:force_style='{sub_style}'"
+        # ATTENTION: path quoté séparément pour éviter le "Unable to open"
+        vf = f'{vf},subtitles={shlex.quote(subs_path)}:force_style={shlex.quote(sub_style)}'
+
     src_low = src.lower()
     is_m3u8 = (src_low.startswith("http") and ".m3u8" in src_low)
     if is_m3u8:
@@ -251,7 +263,6 @@ def _concat_copy_strict(parts: List[str], out_path: str, logger: logging.Logger,
     try:
         _run(_with_threads(cmd), logger, req_id); return "concat_copy"
     except Exception:
-        # fallback filtre (rare)
         inputs = " ".join(f"-i {shlex.quote(p)}" for p in parts)
         n = len(parts); maps = "".join(f"[{i}:v:0]" for i in range(n))
         cmd2 = (f"ffmpeg -y -hide_banner -loglevel error {inputs} "
@@ -285,7 +296,7 @@ def _mix_voice_with_music(voice_path: str, music_path: str, start_at_sec: int,
     )
     _run(_with_threads(cmd), logger, req_id)
 
-# ---- SRT mot par mot (on garde pour plus tard) ----
+# ---- SRT mot par mot ----
 def _sec_to_ts(t: float) -> str:
     t = max(0.0, float(t)); ms = int(round(t*1000))
     h = ms//3600000; ms-=h*3600000
@@ -301,9 +312,9 @@ def _make_word_srt(text: str, dur: float, out_path: str, mode: str = "accumulate
     if not words:
         open(out_path,"w",encoding="utf-8").write(""); return
     n = len(words); step = max(0.08, dur/n); t = 0.0; blocks=[]
-    for i,_w in enumerate(words):
+    for i,w in enumerate(words):
         t1=t; t2=min(dur, t+step)
-        payload = (" ".join(words[:i+1]) if mode=="accumulate" else _w)
+        payload = (" ".join(words[:i+1]) if mode=="accumulate" else w)
         blocks.append(f"{i+1}\n{_sec_to_ts(t1)} --> {_sec_to_ts(t2)}\n{payload}\n"); t=t2
     with open(out_path,"w",encoding="utf-8") as f: f.write("\n".join(blocks))
 
@@ -354,7 +365,7 @@ def generate_video(
 
         # source
         if url.lower().startswith("http") and ".m3u8" in url.lower():
-            src_for_encode = url  # rare
+            src_for_encode = url
         else:
             base = os.path.join(temp_dir, f"src_{int(time.time()*1000)}_{i}")
             src_for_encode = _download(url, base, logger, req_id)
@@ -362,7 +373,7 @@ def generate_video(
             if not (has_video or is_gif):
                 raise RuntimeError("Downloaded file is not media (got HTML). Lien Drive direct requis.")
 
-        # SRT segment (désactivé si burn_mode='none')
+        # SRT segment
         seg_srt = None
         if burn_segments:
             if subtitle_mode.lower().strip() == "word" and txt:
@@ -375,13 +386,13 @@ def generate_video(
         # production du morceau
         part_path = os.path.join(temp_dir, f"part_{i:03d}.mp4")
 
-        # >>> chemin "préencodé strict" = aucun reformat si pas de subs/effets
-        if not seg_srt and style_key == "default":
+        # Chemin “préencodé strict” (aucun reformat si pas de subs & style=default)
+        if (not seg_srt) and style_key == "default":
             _encode_preencoded_copy_or_loop(
                 src_for_encode, part_path, width, height, fps, dur, logger, req_id
             )
         else:
-            # cas avec sous-titres/effets → ancien encode
+            # sous-titres ou style=philo => on réencode avec le filtre adapté
             _encode_uniform_old(
                 src_for_encode, part_path, width, height, fps, dur,
                 logger, req_id, subs_path=seg_srt, sub_style=sub_style, style_key=style_key
