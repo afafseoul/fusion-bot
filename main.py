@@ -1,4 +1,4 @@
-# main.py — API ASYNC (jobs) pour création vidéo, sans route sync
+# main.py — API ASYNC (jobs) pour création vidéo (chemin pré-encodé strict + styles)
 import os, json, time, tempfile, logging, shutil, subprocess, traceback, random, re
 from uuid import uuid4
 from typing import Any, Dict, List, Optional, Tuple
@@ -6,21 +6,21 @@ from flask import Flask, request, jsonify, g
 
 from threading import Thread, Lock
 try:
-    import requests as _requests  # pour le callback
+    import requests as _requests
 except Exception:
     _requests = None
 import urllib.request, urllib.error
 
 from video_generator import generate_video
 
-# --- Google Drive (clé dans Secret Files : credentials.json) ---
+# --- Google Drive ---
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-# ---------------------------------------------------------------
+# --------------------
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-KEEP_TMP  = os.getenv("KEEP_TMP", "1") == "1"   # garder /tmp par défaut
+KEEP_TMP  = os.getenv("KEEP_TMP", "1") == "1"
 
 app = Flask(__name__)
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
@@ -28,16 +28,8 @@ app.logger.setLevel(logging.getLogger().level)
 
 # -------------------- Google Drive helpers --------------------
 def _gdrive_service():
-    """
-    IMPORTANT: scope 'drive' (ou 'drive.readonly') pour lister les fichiers
-    PARTAGÉS au service account. 'drive.file' ne suffit pas.
-    """
     path = os.getenv("GOOGLE_CREDS", "/etc/secrets/credentials.json")
-    scopes = [
-        "https://www.googleapis.com/auth/drive",  # plein accès (upload + list + download)
-        # si tu veux limiter en lecture seule, remplace par:
-        # "https://www.googleapis.com/auth/drive.readonly",
-    ]
+    scopes = ["https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_file(path, scopes=scopes)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
@@ -54,20 +46,12 @@ def _gdrive_upload(file_path: str, file_name: str, folder_id: Optional[str], log
     return resp
 
 def _gdrive_pick_and_download_music(folder_id: str, workdir: str, logger, req_id: str) -> Tuple[Optional[str], int]:
-    """
-    Choisit un fichier audio aléatoire dans un dossier Drive et le télécharge.
-    Retourne (chemin_local, delay_sec). Le délai est détecté via un suffixe @NN
-    juste avant l’extension (ex: 'MaZic@55.mp3' -> delay_sec=55).
-    """
     try:
         svc = _gdrive_service()
-
-        # Requête plus large: audio/* ou extension mp3/wav/m4a
         q = (
             f"'{folder_id}' in parents and trashed=false and "
             f"(mimeType contains 'audio' or name contains '.mp3' or name contains '.wav' or name contains '.m4a')"
         )
-
         files: List[Dict[str, str]] = []
         page_token = None
         while True:
@@ -98,14 +82,11 @@ def _gdrive_pick_and_download_music(folder_id: str, workdir: str, logger, req_id
             while not done:
                 _status, done = downloader.next_chunk()
 
-        # extrait un éventuel @NN avant l'extension -> seconds
         delay_sec = 0
         m = re.search(r"@(\d+)(?=\.[^.]+$)", fname)
         if m:
-            try:
-                delay_sec = int(m.group(1))
-            except Exception:
-                delay_sec = 0
+            try: delay_sec = int(m.group(1))
+            except Exception: delay_sec = 0
 
         return local, delay_sec
     except Exception as e:
@@ -138,16 +119,12 @@ def _end(resp):
     return resp
 
 def _parse_int(s: Any, default: int) -> int:
-    try:
-        return int(s)
-    except Exception:
-        return default
+    try: return int(s)
+    except Exception: return default
 
 def _parse_float(s: Any, default: float) -> float:
-    try:
-        return float(s)
-    except Exception:
-        return default
+    try: return float(s)
+    except Exception: return default
 
 def _normalize_plan(raw: Any) -> List[Dict[str, Any]]:
     if isinstance(raw, (bytes, bytearray)):
@@ -181,7 +158,6 @@ def root():
 # =========================
 #        ASYNC API
 # =========================
-
 JOBS: Dict[str, Dict[str, Any]] = {}
 JLOCK = Lock()
 
@@ -219,7 +195,6 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
             burn_flag     = str(fields.get("burn_subs", "1")).lower().strip()
             burn_active   = burn_flag not in ("0", "false", "no", "none", "")
 
-            # style / sous-titres — tu peux mettre burn_subs=0 et style=default côté inputs
             style         = fields.get("style", "default")
             subtitle_mode = fields.get("subtitle_mode", "sentence")
             word_mode     = fields.get("word_mode", "accumulate")
@@ -264,7 +239,6 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
 
             _set_job(jid, status="running", stage="encoding", updated_at=int(time.time()))
 
-            # >>> Appel avec garde-fou “pré-encodé strict”
             out_path, gen_debug = generate_video(
                 plan=plan,
                 audio_path=audio_path,
@@ -277,10 +251,10 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
                 style=style,
                 subtitle_mode=subtitle_mode,
                 word_mode=word_mode,
+                # musique
                 music_path=music_path,
                 music_delay=music_delay,
                 music_volume=music_volume,
-                strict_preencoded=True,   # 🔒 vérifie format et FPS, sinon on lève une erreur
             )
 
             out_size = os.path.getsize(out_path)
@@ -336,7 +310,6 @@ def create_video_async():
     jid = request.form.get("job_id") or str(uuid4())
     req_id = request.headers.get("X-Request-ID", str(uuid4()))
     tmp = tempfile.mkdtemp(prefix=f"enqueue_{jid}_")
-
     try:
         audio = request.files["audio_file"]
         audio_local = os.path.join(tmp, "voice.mp3")
@@ -355,19 +328,15 @@ def create_video_async():
             "burn_subs": request.form.get("burn_subs", "1"),
             "drive_folder_id": request.form.get("drive_folder_id") or request.args.get("drive_folder_id"),
             "callback_url": request.form.get("callback_url"),
-            # style / sous-titres
             "style": request.form.get("style"),
             "subtitle_mode": request.form.get("subtitle_mode"),
             "word_mode": request.form.get("word_mode"),
-            # musique
             "music_folder_id": request.form.get("music_folder_id"),
             "music_volume": request.form.get("music_volume"),
         }
 
         _set_job(jid, status="queued", job_id=jid, req_id=req_id, enqueued_at=int(time.time()))
-        t = Thread(target=_worker_create_video, args=(jid, fields), daemon=True)
-        t.start()
-
+        Thread(target=_worker_create_video, args=(jid, fields), daemon=True).start()
         return jsonify({"status": "queued", "job_id": jid}), 202
 
     except Exception as e:
@@ -391,8 +360,6 @@ def list_jobs():
             for j in JOBS.values()
         ]
     return jsonify(items)
-
-# =========================
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
