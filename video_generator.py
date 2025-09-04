@@ -1,15 +1,16 @@
 # video_generator.py — plan "ancien" + pré-check préencodage + NO reformat si déjà OK
 import os, time, shutil, subprocess, logging, urllib.request, json, shlex, re
 from typing import Any, Dict, List, Tuple
-FFMPEG_FILTER_THREADS = os.getenv("FFMPEG_FILTER_THREADS", "1").strip()
 
+FFMPEG_FILTER_THREADS = os.getenv("FFMPEG_FILTER_THREADS", "1").strip()
+FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "").strip()
 
 from utils.text_overlay import make_segment_srt, SUB_STYLE_CAPCUT
+from styles import vf_for_style as _vf_for_style  # <-- on prend la version du fichier styles.py
 
 UA = "Mozilla/5.0 (compatible; RenderBot/1.0)"
 DEFAULT_SUB_STYLE = SUB_STYLE_CAPCUT
 
-FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "").strip()
 def _with_threads(cmd: str) -> str:
     return f"{cmd} -threads {FFMPEG_THREADS}" if FFMPEG_THREADS else cmd
 
@@ -189,34 +190,23 @@ def _encode_preencoded_copy_or_loop(
         logger.info(f"[{req_id}] ✅ loop+concat (no reformat) -> {dst}")
 
 # =========================================================
-#       ancien encode (utilisé si subs/effets → ré-encode)
+#       encode (utilisé si subs/effets ou style ≠ default)
 # =========================================================
-def _vf_for_style(width: int, height: int, fps: int, style_key: str) -> str:
-    sk = (style_key or "default").lower().strip()
-    if sk != "philo":
-        return f"scale={width}:{height}:force_original_aspect_ratio=decrease," \
-               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,fps={fps}"
-
-    # carré centré + resize doux + pad vertical 1080x1920
-    inner = int(min(width, height) * 0.78)  # 842 pour 1080x1920
-    return (
-        "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
-        f"scale={inner}:{inner}:flags=bicubic,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
-        f"fps={fps}"
-    )
-
-
 def _encode_uniform_old(
     src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
     logger: logging.Logger, req_id: str,
     subs_path: str = None, sub_style: str = DEFAULT_SUB_STYLE,
     style_key: str = "default"
 ):
+    # vf depuis styles.py
     vf = _vf_for_style(width, height, fps, style_key)
     if subs_path:
-        # ATTENTION: path quoté séparément pour éviter le "Unable to open"
+        # Path/force_style bien quotés
         vf = f'{vf},subtitles={shlex.quote(subs_path)}:force_style={shlex.quote(sub_style)}'
+
+    # flags globaux pour limiter le parallélisme des filtres (stabilité/perf)
+    ft_flags = (f"-filter_threads {FFMPEG_FILTER_THREADS} -filter_complex_threads {FFMPEG_FILTER_THREADS} "
+                if FFMPEG_FILTER_THREADS else "")
 
     src_low = src.lower()
     is_m3u8 = (src_low.startswith("http") and ".m3u8" in src_low)
@@ -231,6 +221,7 @@ def _encode_uniform_old(
     cmd = (
         "ffmpeg -y -hide_banner -loglevel error "
         f"{in_flags} "
+        f"{ft_flags}"
         f'-vf "{vf}" -pix_fmt yuv420p -r {fps} -vsync cfr '
         "-c:v libx264 -preset superfast -crf 26 "
         "-movflags +faststart -video_track_timescale 90000 "
