@@ -1,20 +1,23 @@
-# video_generator.py — plan "ancien" + pré-check préencodage + NO reformat si déjà OK
+# video_generator.py — pré-encodage strict + crop-only en philo + no fps force
 import os, time, shutil, subprocess, logging, urllib.request, json, shlex, re
 from typing import Any, Dict, List, Tuple
 
-FFMPEG_FILTER_THREADS = os.getenv("FFMPEG_FILTER_THREADS", "1").strip()
 FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "").strip()
+FFMPEG_FILTER_THREADS = os.getenv("FFMPEG_FILTER_THREADS", "1").strip()
+def _with_threads(cmd: str) -> str:
+    # -threads pour l'encodeur ; -filter_threads pour limiter la mémoire côté filtres
+    extra = []
+    if FFMPEG_FILTER_THREADS:
+        extra.append(f"-filter_threads {FFMPEG_FILTER_THREADS} -filter_complex_threads {FFMPEG_FILTER_THREADS}")
+    if FFMPEG_THREADS:
+        extra.append(f"-threads {FFMPEG_THREADS}")
+    return f"{cmd} {' '.join(extra)}".strip()
 
 from utils.text_overlay import make_segment_srt, SUB_STYLE_CAPCUT
-from styles import vf_for_style as _vf_for_style  # <-- on prend la version du fichier styles.py
-
 UA = "Mozilla/5.0 (compatible; RenderBot/1.0)"
 DEFAULT_SUB_STYLE = SUB_STYLE_CAPCUT
 
-def _with_threads(cmd: str) -> str:
-    return f"{cmd} -threads {FFMPEG_THREADS}" if FFMPEG_THREADS else cmd
-
-# ---- Styles de sous-titres (tu peux les faire évoluer quand tu réactiveras les subs)
+# ---- Styles de sous-titres (si jamais tu réactives les subs)
 SUB_STYLE_PHILO = (
     "Fontname=Arial,Fontsize=42,PrimaryColour=&H00FFFFFF,"
     "OutlineColour=&H00202020,Outline=3,Shadow=0,BorderStyle=1,"
@@ -73,7 +76,7 @@ def _probe_props(path: str) -> Dict[str, Any]:
     }
 
 def _format_ok_for_target(props: Dict[str, Any], width: int, height: int, fps: int) -> bool:
-    fps_ok = abs((props.get("fps") or 0) - fps) <= 0.6  # tolère 29.97
+    fps_ok = abs((props.get("fps") or 0) - fps) <= 0.6  # tolère 29.97 si tu cibles 30
     return (
         props.get("codec") == "h264" and
         props.get("pix_fmt") == "yuv420p" and
@@ -190,24 +193,43 @@ def _encode_preencoded_copy_or_loop(
         logger.info(f"[{req_id}] ✅ loop+concat (no reformat) -> {dst}")
 
 # =========================================================
-#       encode (utilisé si subs/effets ou style ≠ default)
+#       encode “léger” si on DOIT filtrer (subs / philo)
 # =========================================================
+def _vf_for_style(width: int, height: int, style_key: str) -> str:
+    sk = (style_key or "default").lower().strip()
+
+    if sk == "philo":
+        # IMPORTANT : aucun scale et aucun fps → on ne fait que crop + pad
+        # suppose que tes sources sont déjà 1080x1920; crop produit 1080x1080, puis pad à 1080x1920.
+        return (
+            "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+        )
+
+    # style par défaut : pas de scale ni fps non plus ; on laisse tel quel.
+    # (si on veut juste brûler des sous-titres, pas besoin d'altérer la géométrie)
+    return "setsar=1"
+
 def _encode_uniform_old(
     src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
     logger: logging.Logger, req_id: str,
     subs_path: str = None, sub_style: str = DEFAULT_SUB_STYLE,
     style_key: str = "default"
 ):
-    # vf depuis styles.py
-    vf = _vf_for_style(width, height, fps, style_key)
+    vf_parts = []
+
+    # style (philo = crop+pad seulement; default = noop géométrique)
+    style_vf = _vf_for_style(width, height, style_key)
+    if style_vf:
+        vf_parts.append(style_vf)
+
+    # sous-titres (si demandés)
     if subs_path:
-        # Path/force_style bien quotés
-        vf = f'{vf},subtitles={shlex.quote(subs_path)}:force_style={shlex.quote(sub_style)}'
+        vf_parts.append(f"subtitles={shlex.quote(subs_path)}:force_style={shlex.quote(sub_style)}")
 
-    # flags globaux pour limiter le parallélisme des filtres (stabilité/perf)
-    ft_flags = (f"-filter_threads {FFMPEG_FILTER_THREADS} -filter_complex_threads {FFMPEG_FILTER_THREADS} "
-                if FFMPEG_FILTER_THREADS else "")
+    vf = ",".join(vf_parts)
 
+    # Entrée : boucle uniquement si nécessaire (mp4 court). Pas de -r ni de fps=.
     src_low = src.lower()
     is_m3u8 = (src_low.startswith("http") and ".m3u8" in src_low)
     if is_m3u8:
@@ -221,12 +243,14 @@ def _encode_uniform_old(
     cmd = (
         "ffmpeg -y -hide_banner -loglevel error "
         f"{in_flags} "
-        f"{ft_flags}"
-        f'-vf "{vf}" -pix_fmt yuv420p -r {fps} -vsync cfr '
+        + (f'-vf "{vf}" ' if vf else "")
+        + "-pix_fmt yuv420p "          # format cible sans changer la cadence
         "-c:v libx264 -preset superfast -crf 26 "
+        "-an "                         # pas d'audio dans les morceaux vidéo
         "-movflags +faststart -video_track_timescale 90000 "
         f"{shlex.quote(dst)}"
     )
+
     _run(_with_threads(cmd), logger, req_id)
 
 # =========================================================
@@ -249,8 +273,7 @@ def _concat_copy_strict(parts: List[str], out_path: str, logger: logging.Logger,
         cmd2 = (f"ffmpeg -y -hide_banner -loglevel error {inputs} "
                 f"-filter_complex \"{maps}concat=n={n}:v=1:a=0[v]\" "
                 "-map \"[v]\" -c:v libx264 -preset superfast -crf 26 "
-                "-pix_fmt yuv420p -movflags +faststart -r 30 "
-                "-video_track_timescale 90000 "
+                "-pix_fmt yuv420p -movflags +faststart "
                 f"{shlex.quote(out_path)}")
         _run(_with_threads(cmd2), logger, req_id); return "concat_filter"
 
@@ -354,7 +377,7 @@ def generate_video(
             if not (has_video or is_gif):
                 raise RuntimeError("Downloaded file is not media (got HTML). Lien Drive direct requis.")
 
-        # SRT segment
+        # SRT segment (si brûlage demandé)
         seg_srt = None
         if burn_segments:
             if subtitle_mode.lower().strip() == "word" and txt:
@@ -373,7 +396,7 @@ def generate_video(
                 src_for_encode, part_path, width, height, fps, dur, logger, req_id
             )
         else:
-            # sous-titres ou style=philo => on réencode avec le filtre adapté
+            # style=philo (crop+pad only) OU brûlage de subs → encode léger (sans scale/fps)
             _encode_uniform_old(
                 src_for_encode, part_path, width, height, fps, dur,
                 logger, req_id, subs_path=seg_srt, sub_style=sub_style, style_key=style_key
