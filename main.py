@@ -1,4 +1,4 @@
-# main.py — API sync + async (jobs) pour création vidéo (sans sous-titres)
+# main.py — API sync + async (jobs) pour création vidéo, sans sous-titres (full encode dans le job)
 import os, json, time, tempfile, logging, shutil, subprocess, traceback, random, re
 from uuid import uuid4
 from typing import Any, Dict, List, Optional, Tuple
@@ -6,44 +6,34 @@ from flask import Flask, request, jsonify, g
 
 from threading import Thread, Lock
 try:
-    import requests as _requests  # pour le callback
+    import requests as _requests
 except Exception:
     _requests = None
 import urllib.request, urllib.error
 
 from video_generator import generate_video
 
-# --- Google Drive (clé dans Secret Files : credentials.json) ---
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-# ---------------------------------------------------------------
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-KEEP_TMP  = os.getenv("KEEP_TMP", "1") == "1"   # garder /tmp par défaut
+KEEP_TMP  = os.getenv("KEEP_TMP", "1") == "1"
 
 app = Flask(__name__)
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 app.logger.setLevel(logging.getLogger().level)
 
-# -------------------- Google Drive helpers --------------------
 def _gdrive_service():
-    """
-    IMPORTANT: scope 'drive' (ou 'drive.readonly') pour lister les fichiers
-    PARTAGÉS au service account. 'drive.file' ne suffit pas.
-    """
     path = os.getenv("GOOGLE_CREDS", "/etc/secrets/credentials.json")
-    scopes = [
-        "https://www.googleapis.com/auth/drive",  # plein accès (upload + list + download)
-    ]
+    scopes = ["https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_file(path, scopes=scopes)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def _gdrive_upload(file_path: str, file_name: str, folder_id: Optional[str], logger, req_id: str):
     svc = _gdrive_service()
     meta = {"name": file_name}
-    if folder_id:
-        meta["parents"] = [folder_id]
+    if folder_id: meta["parents"] = [folder_id]
     media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=False)
     resp = svc.files().create(body=meta, media_body=media,
                               fields="id,webViewLink,webContentLink",
@@ -52,17 +42,12 @@ def _gdrive_upload(file_path: str, file_name: str, folder_id: Optional[str], log
     return resp
 
 def _gdrive_pick_and_download_music(folder_id: str, workdir: str, logger, req_id: str) -> Tuple[Optional[str], int]:
-    """
-    Choisit un fichier audio aléatoire dans un dossier Drive et le télécharge.
-    Retourne (chemin_local, delay_sec). Le délai est lu via '@NN' dans le nom (ex: MaZic@55.mp3).
-    """
     try:
         svc = _gdrive_service()
         q = (
             f"'{folder_id}' in parents and trashed=false and "
             f"(mimeType contains 'audio' or name contains '.mp3' or name contains '.wav' or name contains '.m4a')"
         )
-
         files: List[Dict[str, str]] = []
         page_token = None
         while True:
@@ -74,13 +59,13 @@ def _gdrive_pick_and_download_music(folder_id: str, workdir: str, logger, req_id
             ).execute()
             files.extend(resp.get("files", []))
             page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
+            if not page_token: break
 
         if not files:
             logger.warning(f"[{req_id}] ⚠️ aucun fichier audio trouvé dans le dossier {folder_id}")
             return None, 0
 
+        import random, re
         pick = random.choice(files)
         fid, fname = pick["id"], pick["name"]
         local = os.path.join(workdir, f"music_{fname}")
@@ -96,16 +81,12 @@ def _gdrive_pick_and_download_music(folder_id: str, workdir: str, logger, req_id
         delay_sec = 0
         m = re.search(r"@(\d+)(?=\.[^.]+$)", fname)
         if m:
-            try:
-                delay_sec = int(m.group(1))
-            except Exception:
-                delay_sec = 0
-
+            try: delay_sec = int(m.group(1))
+            except Exception: delay_sec = 0
         return local, delay_sec
     except Exception as e:
         logger.exception(f"[{req_id}] erreur download musique: {e}")
         return None, 0
-# ----------------------------------------------------
 
 def _ffprobe_duration(path: str) -> float:
     try:
@@ -132,49 +113,36 @@ def _end(resp):
     return resp
 
 def _parse_int(s: Any, default: int) -> int:
-    try:
-        return int(s)
-    except Exception:
-        return default
+    try: return int(s)
+    except Exception: return default
 
 def _parse_float(s: Any, default: float) -> float:
-    try:
-        return float(s)
-    except Exception:
-        return default
+    try: return float(s)
+    except Exception: return default
 
 def _normalize_plan(raw: Any) -> List[Dict[str, Any]]:
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode("utf-8","ignore")
+    if isinstance(raw, (bytes, bytearray)): raw = raw.decode("utf-8","ignore")
     if isinstance(raw, str):
         try:
             if LOG_LEVEL == "DEBUG":
                 app.logger.info(f"[{g.req_id}] plan_len={len(raw)} head={raw[:400].replace(chr(10),' ')}")
-        except Exception:
-            pass
+        except Exception: pass
         try:
             raw = json.loads(raw)
         except json.JSONDecodeError:
             last = raw.rfind("}")
-            if last != -1:
-                raw = json.loads(raw[:last+1])
-            else:
-                raise
-    if isinstance(raw, dict) and "plan" in raw:
-        raw = raw["plan"]
-    if not isinstance(raw, list):
-        raise ValueError("plan must be a JSON array")
-    if not raw:
-        raise ValueError("plan is empty")
+            if last != -1: raw = json.loads(raw[:last+1])
+            else: raise
+    if isinstance(raw, dict) and "plan" in raw: raw = raw["plan"]
+    if not isinstance(raw, list): raise ValueError("plan must be a JSON array")
+    if not raw: raise ValueError("plan is empty")
     return raw
 
 @app.get("/")
 def root():
     return jsonify(ok=True, service="fusion-bot", ts=int(time.time()))
 
-# =========================
-#         SYNC API
-# =========================
+# ---------------- SYNC ----------------
 @app.post("/create-video")
 def create_video():
     workdir = None
@@ -186,14 +154,13 @@ def create_video():
         plan_str = request.form["plan"]
         audio_file = request.files["audio_file"]
 
-        # style & musique
         style           = request.form.get("style", "default")
         music_folder_id = request.form.get("music_folder_id")
         music_volume    = _parse_float(request.form.get("music_volume", 0.25), 0.25)
-
         drive_folder_id = request.form.get("drive_folder_id") or request.args.get("drive_folder_id")
 
-        app.logger.info(f"[{g.req_id}] fields ok name={output_name} {width}x{height}@{fps} audio={getattr(audio_file,'filename',None)} style={style}")
+        app.logger.info(f"[{g.req_id}] fields ok name={output_name} {width}x{height}@{fps} "
+                        f"audio={getattr(audio_file,'filename',None)} style={style}")
 
         plan = _normalize_plan(plan_str)
 
@@ -208,14 +175,12 @@ def create_video():
         debug_dir = os.path.join(workdir, "debug")
         os.makedirs(debug_dir, exist_ok=True)
 
-        # audio voix
         audio_path = os.path.join(workdir, "voice.mp3")
         audio_file.save(audio_path)
         audio_size = os.path.getsize(audio_path)
         audio_dur  = _ffprobe_duration(audio_path)
         app.logger.info(f"[{g.req_id}] audio path={audio_path} size={audio_size}B dur={audio_dur:.3f}s")
 
-        # musique BG (si dossier fourni)
         music_path, music_delay = (None, 0)
         if music_folder_id:
             music_path, music_delay = _gdrive_pick_and_download_music(music_folder_id, workdir, app.logger, g.req_id)
@@ -269,9 +234,7 @@ def create_video():
         except Exception:
             pass
 
-# =========================
-#        ASYNC API
-# =========================
+# ---------------- ASYNC ----------------
 JOBS: Dict[str, Dict[str, Any]] = {}
 JLOCK = Lock()
 
@@ -305,14 +268,13 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
             plan_str      = fields["plan"]
             audio_srcpath = fields["audio_path"]
 
-            # style & musique
             style           = fields.get("style", "default")
+            drive_folder_id = fields.get("drive_folder_id")
             music_folder_id = fields.get("music_folder_id")
             music_volume    = _parse_float(fields.get("music_volume", 0.25), 0.25)
 
-            drive_folder_id = fields.get("drive_folder_id")
-
-            app.logger.info(f"[{req_id}] (async) start job {jid} name={output_name} {width}x{height}@{fps} style={style}")
+            app.logger.info(f"[{req_id}] (async) start job {jid} name={output_name} "
+                            f"{width}x{height}@{fps} style={style}")
 
             plan = _normalize_plan(plan_str)
 
@@ -327,14 +289,12 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
             debug_dir = os.path.join(workdir, "debug")
             os.makedirs(debug_dir, exist_ok=True)
 
-            # voix
             audio_path = os.path.join(workdir, "voice.mp3")
             shutil.copy2(audio_srcpath, audio_path)
             audio_size = os.path.getsize(audio_path)
             audio_dur  = _ffprobe_duration(audio_path)
             app.logger.info(f"[{req_id}] audio path={audio_path} size={audio_size}B dur={audio_dur:.3f}s")
 
-            # musique BG
             music_path, music_delay = (None, 0)
             if music_folder_id:
                 music_path, music_delay = _gdrive_pick_and_download_music(music_folder_id, workdir, app.logger, req_id)
@@ -389,7 +349,6 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
                     result["drive_error"] = str(e)
 
             _set_job(jid, **result)
-
             if callback_url:
                 _post_callback(callback_url, {"job_id": jid, **result})
 
@@ -428,16 +387,13 @@ def create_video_async():
             "audio_path": audio_local,
             "drive_folder_id": request.form.get("drive_folder_id") or request.args.get("drive_folder_id"),
             "callback_url": request.form.get("callback_url"),
-            # style & musique
             "style": request.form.get("style"),
             "music_folder_id": request.form.get("music_folder_id"),
             "music_volume": request.form.get("music_volume"),
         }
 
         _set_job(jid, status="queued", job_id=jid, req_id=req_id, enqueued_at=int(time.time()))
-        t = Thread(target=_worker_create_video, args=(jid, fields), daemon=True)
-        t.start()
-
+        Thread(target=_worker_create_video, args=(jid, fields), daemon=True).start()
         return jsonify({"status": "queued", "job_id": jid}), 202
 
     except Exception as e:
@@ -461,8 +417,6 @@ def list_jobs():
             for j in JOBS.values()
         ]
     return jsonify(items)
-
-# =========================
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
