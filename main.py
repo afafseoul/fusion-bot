@@ -1,4 +1,4 @@
-# main.py — API sync + async (jobs) pour création vidéo
+# main.py — API sync + async (jobs) pour création vidéo (sans sous-titres)
 import os, json, time, tempfile, logging, shutil, subprocess, traceback, random, re
 from uuid import uuid4
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,8 +35,6 @@ def _gdrive_service():
     path = os.getenv("GOOGLE_CREDS", "/etc/secrets/credentials.json")
     scopes = [
         "https://www.googleapis.com/auth/drive",  # plein accès (upload + list + download)
-        # si tu veux limiter en lecture seule, remplace par:
-        # "https://www.googleapis.com/auth/drive.readonly",
     ]
     creds = Credentials.from_service_account_file(path, scopes=scopes)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
@@ -56,13 +54,10 @@ def _gdrive_upload(file_path: str, file_name: str, folder_id: Optional[str], log
 def _gdrive_pick_and_download_music(folder_id: str, workdir: str, logger, req_id: str) -> Tuple[Optional[str], int]:
     """
     Choisit un fichier audio aléatoire dans un dossier Drive et le télécharge.
-    Retourne (chemin_local, delay_sec). Le délai est détecté via un suffixe @NN
-    juste avant l’extension (ex: 'MaZic@55.mp3' -> delay_sec=55).
+    Retourne (chemin_local, delay_sec). Le délai est lu via '@NN' dans le nom (ex: MaZic@55.mp3).
     """
     try:
         svc = _gdrive_service()
-
-        # Requête plus large: audio/* ou extension mp3/wav/m4a
         q = (
             f"'{folder_id}' in parents and trashed=false and "
             f"(mimeType contains 'audio' or name contains '.mp3' or name contains '.wav' or name contains '.m4a')"
@@ -98,7 +93,6 @@ def _gdrive_pick_and_download_music(folder_id: str, workdir: str, logger, req_id
             while not done:
                 _status, done = downloader.next_chunk()
 
-        # extrait un éventuel @NN avant l'extension -> seconds
         delay_sec = 0
         m = re.search(r"@(\d+)(?=\.[^.]+$)", fname)
         if m:
@@ -191,23 +185,15 @@ def create_video():
         fps    = _parse_int(request.form.get("fps", 30), 30)
         plan_str = request.form["plan"]
         audio_file = request.files["audio_file"]
-        global_srt = request.form.get("global_srt")
-        burn_mode  = request.form.get("burn_mode", os.getenv("BURN_MODE", "segment"))
-        burn_flag  = str(request.form.get("burn_subs", "1")).lower().strip()
-        burn_active = burn_flag not in ("0", "false", "no", "none", "")
 
-        # >>>>> NOUVEAU : style / sous-titres
-        style         = request.form.get("style", "default")
-        subtitle_mode = request.form.get("subtitle_mode", "sentence")
-        word_mode     = request.form.get("word_mode", "accumulate")
-
-        # musique optionnelle
+        # style & musique
+        style           = request.form.get("style", "default")
         music_folder_id = request.form.get("music_folder_id")
         music_volume    = _parse_float(request.form.get("music_volume", 0.25), 0.25)
 
         drive_folder_id = request.form.get("drive_folder_id") or request.args.get("drive_folder_id")
 
-        app.logger.info(f"[{g.req_id}] fields ok name={output_name} {width}x{height}@{fps} audio={getattr(audio_file,'filename',None)} style={style} smode={subtitle_mode} wmode={word_mode}")
+        app.logger.info(f"[{g.req_id}] fields ok name={output_name} {width}x{height}@{fps} audio={getattr(audio_file,'filename',None)} style={style}")
 
         plan = _normalize_plan(plan_str)
 
@@ -246,18 +232,10 @@ def create_video():
             temp_dir=workdir,
             width=width, height=height, fps=fps,
             logger=app.logger, req_id=g.req_id,
-            global_srt=global_srt,
-            burn_mode=("none" if not burn_active else burn_mode),
-            # >>>>> NOUVEAU : style / sous-titres
             style=style,
-            subtitle_mode=subtitle_mode,
-            word_mode=word_mode,
-            # musique
             music_path=music_path,
             music_delay=music_delay,
             music_volume=music_volume,
-            # >>>>> GARDE-FOU PRÉ-ENCODAGE (ajouté)
-            strict_preencoded=True,
         )
 
         out_size = os.path.getsize(out_path)
@@ -294,7 +272,6 @@ def create_video():
 # =========================
 #        ASYNC API
 # =========================
-
 JOBS: Dict[str, Dict[str, Any]] = {}
 JLOCK = Lock()
 
@@ -327,23 +304,15 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
             fps           = _parse_int(fields.get("fps", 30), 30)
             plan_str      = fields["plan"]
             audio_srcpath = fields["audio_path"]
-            global_srt    = fields.get("global_srt")
-            burn_mode     = fields.get("burn_mode", os.getenv("BURN_MODE", "segment"))
-            burn_flag     = str(fields.get("burn_subs", "1")).lower().strip()
-            burn_active   = burn_flag not in ("0", "false", "no", "none", "")
 
-            # >>>>> NOUVEAU : style / sous-titres
-            style         = fields.get("style", "default")
-            subtitle_mode = fields.get("subtitle_mode", "sentence")
-            word_mode     = fields.get("word_mode", "accumulate")
-
-            drive_folder_id = fields.get("drive_folder_id")
-
-            # musique
+            # style & musique
+            style           = fields.get("style", "default")
             music_folder_id = fields.get("music_folder_id")
             music_volume    = _parse_float(fields.get("music_volume", 0.25), 0.25)
 
-            app.logger.info(f"[{req_id}] (async) start job {jid} name={output_name} {width}x{height}@{fps} style={style} smode={subtitle_mode} wmode={word_mode}")
+            drive_folder_id = fields.get("drive_folder_id")
+
+            app.logger.info(f"[{req_id}] (async) start job {jid} name={output_name} {width}x{height}@{fps} style={style}")
 
             plan = _normalize_plan(plan_str)
 
@@ -384,18 +353,10 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
                 temp_dir=workdir,
                 width=width, height=height, fps=fps,
                 logger=app.logger, req_id=req_id,
-                global_srt=global_srt,
-                burn_mode=("none" if not burn_active else burn_mode),
-                # >>>>> NOUVEAU : style / sous-titres
                 style=style,
-                subtitle_mode=subtitle_mode,
-                word_mode=word_mode,
-                # musique
                 music_path=music_path,
                 music_delay=music_delay,
                 music_volume=music_volume,
-                # >>>>> GARDE-FOU PRÉ-ENCODAGE (ajouté)
-                strict_preencoded=True,
             )
 
             out_size = os.path.getsize(out_path)
@@ -465,16 +426,10 @@ def create_video_async():
             "fps": request.form.get("fps"),
             "plan": request.form["plan"],
             "audio_path": audio_local,
-            "global_srt": request.form.get("global_srt"),
-            "burn_mode": request.form.get("burn_mode", os.getenv("BURN_MODE", "segment")),
-            "burn_subs": request.form.get("burn_subs", "1"),
             "drive_folder_id": request.form.get("drive_folder_id") or request.args.get("drive_folder_id"),
             "callback_url": request.form.get("callback_url"),
-            # >>>>> NOUVEAU : style / sous-titres
+            # style & musique
             "style": request.form.get("style"),
-            "subtitle_mode": request.form.get("subtitle_mode"),
-            "word_mode": request.form.get("word_mode"),
-            # musique
             "music_folder_id": request.form.get("music_folder_id"),
             "music_volume": request.form.get("music_volume"),
         }
