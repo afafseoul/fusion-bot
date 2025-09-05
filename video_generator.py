@@ -98,7 +98,7 @@ def _encode_segment_default(src: str, dst: str, need_dur: float, width: int, hei
 
 # ---------- Encodage via style (philo, etc.) ----------
 def _encode_segment_with_style(src: str, dst: str, need_dur: float, width: int, height: int, fps: int,
-                               style_key: str, logger: logging.Logger, req_id: str):
+                               style_key: str, logger: logging.Logger, req_id: str, temp_dir: str):
     src_low = src.lower()
     if src_low.startswith("http") and ".m3u8" in src_low:
         in_flags = ('-protocol_whitelist "file,http,https,tcp,tls,crypto" '
@@ -109,7 +109,9 @@ def _encode_segment_with_style(src: str, dst: str, need_dur: float, width: int, 
         in_flags = f'-stream_loop -1 -t {need_dur:.3f} -i {shlex.quote(src)}'
 
     # Récupère (extra_inputs, filter_complex, map_label) auprès du style choisi
-    extra_inputs, filter_complex, map_label = build_style(style_key, need_dur, width, height, fps)
+    extra_inputs, filter_complex, map_label = build_style(
+        style_key, need_dur, width, height, fps, temp_dir
+    )
 
     cmd = (
         "ffmpeg -y -hide_banner -loglevel error "
@@ -209,7 +211,10 @@ def generate_video(
         # encodage : route default vs styles
         part_path = os.path.join(temp_dir, f"part_{i:03d}.mp4")
         if style_key and style_key != "default":
-            _encode_segment_with_style(src_for_encode, part_path, dur, width, height, fps, style_key, logger, req_id)
+            _encode_segment_with_style(
+                src_for_encode, part_path, dur, width, height, fps,
+                style_key, logger, req_id, temp_dir  # <-- passage de temp_dir
+            )
         else:
             _encode_segment_default(src_for_encode, part_path, dur, width, height, fps, logger, req_id)
 
@@ -241,7 +246,7 @@ def generate_video(
         "mode": concat_mode,
         "items": len(parts),
         "style": (style_key or "default"),
-        "effects": ("philo" if style_key == "philo" else "none"),
+        "effects": ("philo" if style_key == "philo" else ("rounded" if style_key == "rounded" else "none")),
         "music": bool(music_path),
         "music_start_at": int(music_delay) if music_path else 0,
         "music_volume": float(music_volume) if music_path else 0.0,
