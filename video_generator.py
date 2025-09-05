@@ -1,29 +1,20 @@
-# video_generator.py — pré-encodage strict + crop-only en philo + no fps force
-import os, time, shutil, subprocess, logging, urllib.request, json, shlex, re
+# video_generator.py — PREENCODE strict (copy) + style "philo" (crop+pad only) + no subtitles
+import os, time, shutil, subprocess, logging, urllib.request, json, shlex
 from typing import Any, Dict, List, Tuple
 
+UA = "Mozilla/5.0 (compatible; RenderBot/1.0)"
+
+# Limiteurs de threads (RAM)
 FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "").strip()
 FFMPEG_FILTER_THREADS = os.getenv("FFMPEG_FILTER_THREADS", "1").strip()
+
 def _with_threads(cmd: str) -> str:
-    # -threads pour l'encodeur ; -filter_threads pour limiter la mémoire côté filtres
     extra = []
     if FFMPEG_FILTER_THREADS:
         extra.append(f"-filter_threads {FFMPEG_FILTER_THREADS} -filter_complex_threads {FFMPEG_FILTER_THREADS}")
     if FFMPEG_THREADS:
         extra.append(f"-threads {FFMPEG_THREADS}")
     return f"{cmd} {' '.join(extra)}".strip()
-
-from utils.text_overlay import make_segment_srt, SUB_STYLE_CAPCUT
-UA = "Mozilla/5.0 (compatible; RenderBot/1.0)"
-DEFAULT_SUB_STYLE = SUB_STYLE_CAPCUT
-
-# ---- Styles de sous-titres (si jamais tu réactives les subs)
-SUB_STYLE_PHILO = (
-    "Fontname=Arial,Fontsize=42,PrimaryColour=&H00FFFFFF,"
-    "OutlineColour=&H00202020,Outline=3,Shadow=0,BorderStyle=1,"
-    "Alignment=2,MarginL=60,MarginR=60,MarginV=96,Spacing=0,ScaleX=100,ScaleY=100"
-)
-STYLE_SUB_MAP = {"philo": SUB_STYLE_PHILO, "default": DEFAULT_SUB_STYLE, "capcut": DEFAULT_SUB_STYLE}
 
 # =========================================================
 #                       utils ffmpeg
@@ -76,7 +67,7 @@ def _probe_props(path: str) -> Dict[str, Any]:
     }
 
 def _format_ok_for_target(props: Dict[str, Any], width: int, height: int, fps: int) -> bool:
-    fps_ok = abs((props.get("fps") or 0) - fps) <= 0.6  # tolère 29.97 si tu cibles 30
+    fps_ok = abs((props.get("fps") or 0) - fps) <= 0.6  # accepte 29.97 si cible 30
     return (
         props.get("codec") == "h264" and
         props.get("pix_fmt") == "yuv420p" and
@@ -193,43 +184,23 @@ def _encode_preencoded_copy_or_loop(
         logger.info(f"[{req_id}] ✅ loop+concat (no reformat) -> {dst}")
 
 # =========================================================
-#       encode “léger” si on DOIT filtrer (subs / philo)
+#       encode “léger” si on DOIT filtrer (style philo)
 # =========================================================
 def _vf_for_style(width: int, height: int, style_key: str) -> str:
     sk = (style_key or "default").lower().strip()
-
     if sk == "philo":
-        # IMPORTANT : aucun scale et aucun fps → on ne fait que crop + pad
-        # suppose que tes sources sont déjà 1080x1920; crop produit 1080x1080, puis pad à 1080x1920.
+        # crop carré centré + pad vertical ; pas de scale, pas de fps
         return (
             "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
         )
+    return ""  # pas de filtre géométrique en "default"
 
-    # style par défaut : pas de scale ni fps non plus ; on laisse tel quel.
-    # (si on veut juste brûler des sous-titres, pas besoin d'altérer la géométrie)
-    return "setsar=1"
-
-def _encode_uniform_old(
-    src: str, dst: str, width: int, height: int, fps: int, need_dur: float,
-    logger: logging.Logger, req_id: str,
-    subs_path: str = None, sub_style: str = DEFAULT_SUB_STYLE,
-    style_key: str = "default"
+def _encode_with_style(
+    src: str, dst: str, width: int, height: int, need_dur: float,
+    logger: logging.Logger, req_id: str, style_key: str
 ):
-    vf_parts = []
-
-    # style (philo = crop+pad seulement; default = noop géométrique)
-    style_vf = _vf_for_style(width, height, style_key)
-    if style_vf:
-        vf_parts.append(style_vf)
-
-    # sous-titres (si demandés)
-    if subs_path:
-        vf_parts.append(f"subtitles={shlex.quote(subs_path)}:force_style={shlex.quote(sub_style)}")
-
-    vf = ",".join(vf_parts)
-
-    # Entrée : boucle uniquement si nécessaire (mp4 court). Pas de -r ni de fps=.
+    vf = _vf_for_style(width, height, style_key)
     src_low = src.lower()
     is_m3u8 = (src_low.startswith("http") and ".m3u8" in src_low)
     if is_m3u8:
@@ -244,17 +215,16 @@ def _encode_uniform_old(
         "ffmpeg -y -hide_banner -loglevel error "
         f"{in_flags} "
         + (f'-vf "{vf}" ' if vf else "")
-        + "-pix_fmt yuv420p "          # format cible sans changer la cadence
+        + "-pix_fmt yuv420p "
         "-c:v libx264 -preset superfast -crf 26 "
-        "-an "                         # pas d'audio dans les morceaux vidéo
+        "-an "
         "-movflags +faststart -video_track_timescale 90000 "
         f"{shlex.quote(dst)}"
     )
-
     _run(_with_threads(cmd), logger, req_id)
 
 # =========================================================
-#            concat vidéo + audio/mix (comme avant)
+#            concat vidéo + audio/mix
 # =========================================================
 def _concat_copy_strict(parts: List[str], out_path: str, logger: logging.Logger, req_id: str) -> str:
     list_path = out_path + ".txt"
@@ -300,28 +270,6 @@ def _mix_voice_with_music(voice_path: str, music_path: str, start_at_sec: int,
     )
     _run(_with_threads(cmd), logger, req_id)
 
-# ---- SRT mot par mot ----
-def _sec_to_ts(t: float) -> str:
-    t = max(0.0, float(t)); ms = int(round(t*1000))
-    h = ms//3600000; ms-=h*3600000
-    m = ms//60000;   ms-=m*60000
-    s = ms//1000;    ms-=s*1000
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-def _make_word_srt(text: str, dur: float, out_path: str, mode: str = "accumulate"):
-    txt = (text or "").strip()
-    if not txt or dur <= 0:
-        open(out_path,"w",encoding="utf-8").write(""); return
-    words = re.findall(r"\S+", txt)
-    if not words:
-        open(out_path,"w",encoding="utf-8").write(""); return
-    n = len(words); step = max(0.08, dur/n); t = 0.0; blocks=[]
-    for i,w in enumerate(words):
-        t1=t; t2=min(dur, t+step)
-        payload = (" ".join(words[:i+1]) if mode=="accumulate" else w)
-        blocks.append(f"{i+1}\n{_sec_to_ts(t1)} --> {_sec_to_ts(t2)}\n{payload}\n"); t=t2
-    with open(out_path,"w",encoding="utf-8") as f: f.write("\n".join(blocks))
-
 # =========================================================
 #                    GENERATE VIDEO (plan)
 # =========================================================
@@ -335,26 +283,14 @@ def generate_video(
     fps: int,
     logger: logging.Logger,
     req_id: str,
-    sub_style: str = DEFAULT_SUB_STYLE,
     style: str = "default",
-    subtitle_mode: str = "sentence",
-    word_mode: str = "accumulate",
-    global_srt: str = None,
-    burn_mode: str = None,
     music_path: str = None,
     music_delay: int = 0,
     music_volume: float = 0.25,
-    **kwargs
 ):
     style_key = (style or "default").lower().strip()
-    if style_key in STYLE_SUB_MAP:
-        sub_style = STYLE_SUB_MAP[style_key]
-
-    mode_burn = (burn_mode or "segment").lower().strip()
-    burn_segments = (mode_burn != "none")
 
     parts: List[str] = []
-    has_seg_times = burn_segments and any((seg.get("subtitles") for seg in plan))
     t_running = 0.0
 
     for i, seg in enumerate(plan):
@@ -364,7 +300,7 @@ def generate_video(
         except Exception: dur = 0.0
         if dur <= 0.0: dur = 0.5
         start = float(seg.get("start_time")) if seg.get("start_time") is not None else t_running
-        txt = (seg.get("text") or "").strip()
+
         logger.info(f"[{req_id}] seg#{i} start={start:.3f} dur={dur:.3f} url={url}")
 
         # source
@@ -377,29 +313,18 @@ def generate_video(
             if not (has_video or is_gif):
                 raise RuntimeError("Downloaded file is not media (got HTML). Lien Drive direct requis.")
 
-        # SRT segment (si brûlage demandé)
-        seg_srt = None
-        if burn_segments:
-            if subtitle_mode.lower().strip() == "word" and txt:
-                seg_srt = os.path.join(temp_dir, f"seg_{i:03d}.srt")
-                _make_word_srt(txt, dur, seg_srt, mode=(word_mode or "accumulate").lower().strip())
-            elif has_seg_times:
-                seg_srt = os.path.join(temp_dir, f"seg_{i:03d}.srt")
-                make_segment_srt(seg.get("subtitles"), txt, start, dur, seg_srt)
-
-        # production du morceau
+        # morceau
         part_path = os.path.join(temp_dir, f"part_{i:03d}.mp4")
 
-        # Chemin “préencodé strict” (aucun reformat si pas de subs & style=default)
-        if (not seg_srt) and style_key == "default":
+        if style_key == "default":
+            # 0 re-encode si pré-encodage OK
             _encode_preencoded_copy_or_loop(
                 src_for_encode, part_path, width, height, fps, dur, logger, req_id
             )
         else:
-            # style=philo (crop+pad only) OU brûlage de subs → encode léger (sans scale/fps)
-            _encode_uniform_old(
-                src_for_encode, part_path, width, height, fps, dur,
-                logger, req_id, subs_path=seg_srt, sub_style=sub_style, style_key=style_key
+            # style philo = crop+pad only (sans scale/fps)
+            _encode_with_style(
+                src_for_encode, part_path, width, height, dur, logger, req_id, style_key=style_key
             )
 
         parts.append(part_path)
@@ -409,7 +334,7 @@ def generate_video(
     if not parts:
         raise ValueError("empty parts")
 
-    # concat vidéo (copy) puis audio/mix
+    # concat vidéo puis audio/mix
     video_only = os.path.join(temp_dir, "_video.mp4")
     concat_mode = _concat_copy_strict(parts, video_only, logger, req_id)
 
@@ -428,16 +353,11 @@ def generate_video(
 
     debug = {
         "mode": concat_mode,
-        "subs": ("burned_per_segment" if has_seg_times or subtitle_mode.lower()=="word"
-                 else ("none" if not burn_segments else "no_times")),
         "items": len(parts),
-        "burn_mode": mode_burn,
         "style": style_key,
-        "subtitle_mode": subtitle_mode,
-        "word_mode": word_mode,
         "music": bool(music_path),
         "music_start_at": int(music_delay) if music_path else 0,
         "music_volume": float(music_volume) if music_path else 0.0,
-        "strict_preencoded_path": (not burn_segments and style_key=="default"),
+        "strict_preencoded_path": (style_key == "default"),
     }
     return out_path, debug
