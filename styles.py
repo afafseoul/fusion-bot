@@ -1,29 +1,60 @@
-# styles.py — styles vidéo quand on réencode tout (scale + fps + pad)
+# styles.py — styles FFmpeg (seulement appelés si style != "default")
+from typing import Tuple
 
-def vf_for_style_full(width: int, height: int, fps: int, style_key: str) -> str:
+def philo(need_dur: float, width: int, height: int, fps: int) -> Tuple[str, str, str]:
     """
-    Rend la chaîne -vf complète, y compris le fps=.
-    - default : letterbox vers {width}x{height}, puis fps={fps}
-    - philo   : crop carré centré -> scale (≈78% du côté min) -> pad {width}x{height} -> fps={fps}
+    Carré centré ~0.78 * min(1080,1920), coins arrondis, et effet 'film' très léger.
+    Tout est interne (aucun input API supplémentaire).
     """
-    sk = (style_key or "default").lower().strip()
+    inner_px  = int(min(width, height) * 0.78)   # ~842 pour 1080x1920
+    inner_px  = max(200, inner_px)
+    radius_px = max(8, inner_px // 18)           # ~48 pour 842
+    r = int(radius_px)
 
-    if sk == "philo":
-        inner = int(min(width, height) * 0.78)  # ~842 pour 1080x1920
-        return (
-            # carré centré depuis la source
-            "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
-            # réduction douce du carré pour bien voir l'effet
-            f"scale={inner}:{inner}:flags=bicubic,"
-            # placement centré en 1080x1920
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
-            # cadence constante et ratio pixel propre
-            f"fps={fps},setsar=1"
-        )
-
-    # default: letterbox propre + fps constant
-    return (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
-        f"fps={fps},setsar=1"
+    # Effet "film" très léger (cheap): grain + vignette douce + fines scanlines
+    film_chain = (
+        ",noise=alls=6:allf=t"
+        ",vignette=PI/14"
+        ",drawgrid=width=2:height=2:thickness=1:color=black@0.06"
     )
+
+    # Étapes:
+    # 1) crop carré -> scale -> fps -> setsar
+    base = (
+        f"[0:v]"
+        f"crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
+        f"scale={inner_px}:{inner_px}:flags=bicubic,"
+        f"fps={fps},setsar=1[base]"
+    )
+
+    # 2) fabriquer un masque alpha arrondi (sur un patch blanc taille inner_px)
+    alpha_expr = (
+        f"if(between(X,{r},W-{r})*between(Y,{r},H-{r})"
+        f"+lte(hypot(X-{r},Y-{r}),{r})"
+        f"+lte(hypot(X-(W-{r}),Y-{r}),{r})"
+        f"+lte(hypot(X-{r},Y-(H-{r})),{r})"
+        f"+lte(hypot(X-(W-{r}),Y-(H-{r})),{r}),255,0)"
+    )
+
+    fc = (
+        f"{base};"
+        f"[1:v]geq=lum=0:cb=0:cr=0:alpha='{alpha_expr}',format=rgba[mask];"
+        f"[base]format=rgba[b_rgba];[b_rgba][mask]alphamerge[rounded];"
+        f"[rounded]pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black{film_chain},"
+        f"format=yuv420p[v]"
+    )
+
+    # 2e entrée: patch blanc pour le masque (peu coûteux)
+    extra_inputs = f"-f lavfi -t {need_dur:.3f} -i color=c=white@1.0:s={inner_px}x{inner_px}"
+    return extra_inputs, fc, "[v]"
+
+# Registry / factory
+_REGISTRY = { "philo": philo }
+
+def build(style_key: str, need_dur: float, width: int, height: int, fps: int) -> Tuple[str, str, str]:
+    key = (style_key or "default").lower().strip()
+    fn = _REGISTRY.get(key)
+    if not fn:
+        # Fallback : si style inconnu, on laissera l'appelant gérer (ne devrait pas arriver).
+        raise ValueError(f"Unknown style: {key}")
+    return fn(need_dur, width, height, fps)
