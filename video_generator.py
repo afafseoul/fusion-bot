@@ -67,10 +67,11 @@ def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> 
 def _encode_segment_default(src: str, dst: str, need_dur: float, width: int, height: int, fps: int,
                             logger: logging.Logger, req_id: str):
     """
-    Encodage standard: crop carré centré -> scale à min(width,height) -> pad en WxH,
-    fps forcé, yuv420p. Zéro effet, zéro coins arrondis.
+    Encodage standard: crop carré centré -> pad en WxH (1080x1920),
+    sans filtres ni arrondis. On évite l'upscale : on ne réduit QUE si le carré > min(width,height).
     """
-    inner = min(width, height)
+    inner = min(width, height)  # 1080 si sortie 1080x1920
+
     src_low = src.lower()
     if src_low.startswith("http") and ".m3u8" in src_low:
         in_flags = ('-protocol_whitelist "file,http,https,tcp,tls,crypto" '
@@ -80,9 +81,12 @@ def _encode_segment_default(src: str, dst: str, need_dur: float, width: int, hei
     else:
         in_flags = f'-stream_loop -1 -t {need_dur:.3f} -i {shlex.quote(src)}'
 
+    # 1) crop au carré centré
+    # 2) scale conditionnel : si le carré > inner (ex: 2000x2000), on downscale à inner; sinon on garde la taille
+    # 3) pad en 1080x1920 (ou WxH) au centre
     vf = (
         "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
-        f"scale={inner}:{inner}:flags=bicubic,"
+        f"scale='if(gt(iw,{inner}),{inner},iw)':'if(gt(ih,{inner}),{inner},ih)':flags=bicubic,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
         f"fps={fps},setsar=1,format=yuv420p"
     )
@@ -185,16 +189,23 @@ def generate_video(
     music_volume: float = 0.25,
     **kwargs
 ):
-    style_key = (style or "default").lower().strip()
+    # Sécurise le style (évite .lower() sur un float)
+    style_key = str(style or "default").lower().strip()
+
     parts: List[str] = []
     t_running = 0.0
 
     for i, seg in enumerate(plan):
         url = seg.get("gif_url") or seg.get("url") or seg.get("video_url")
-        if not url: raise ValueError(f"plan[{i}] missing url/gif_url")
-        try: dur = float(seg.get("duration") or 0.0)
-        except Exception: dur = 0.0
-        if dur <= 0.0: dur = 0.5
+        if not url:
+            raise ValueError(f"plan[{i}] missing url/gif_url")
+        try:
+            dur = float(seg.get("duration") or 0.0)
+        except Exception:
+            dur = 0.0
+        if dur <= 0.0:
+            dur = 0.5
+
         start = float(seg.get("start_time")) if seg.get("start_time") is not None else t_running
         logger.info(f"[{req_id}] seg#{i} start={start:.3f} dur={dur:.3f} url={url}")
 
@@ -213,7 +224,7 @@ def generate_video(
         if style_key and style_key != "default":
             _encode_segment_with_style(
                 src_for_encode, part_path, dur, width, height, fps,
-                style_key, logger, req_id, temp_dir  # <-- passage de temp_dir
+                style_key, logger, req_id, temp_dir
             )
         else:
             _encode_segment_default(src_for_encode, part_path, dur, width, height, fps, logger, req_id)
