@@ -67,8 +67,10 @@ def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> 
 def _encode_segment_default(src: str, dst: str, need_dur: float, width: int, height: int, fps: int,
                             logger: logging.Logger, req_id: str):
     """
-    Encodage standard: crop carré centré -> pad en WxH (1080x1920),
-    sans filtres ni arrondis. On évite l'upscale : on ne réduit QUE si le carré > min(width,height).
+    AUCUN redimensionnement.
+    1) crop carré centré de taille min(min(iw,ih), inner) -> jamais d'up/downscale
+    2) pad en WxH au centre (bandes noires)
+    3) fps, setsar, yuv420p
     """
     inner = min(width, height)  # 1080 si sortie 1080x1920
 
@@ -81,12 +83,15 @@ def _encode_segment_default(src: str, dst: str, need_dur: float, width: int, hei
     else:
         in_flags = f'-stream_loop -1 -t {need_dur:.3f} -i {shlex.quote(src)}'
 
-    # 1) crop au carré centré
-    # 2) scale conditionnel : si le carré > inner (ex: 2000x2000), on downscale à inner; sinon on garde la taille
-    # 3) pad en 1080x1920 (ou WxH) au centre
+    # Taille du carré recadré = min(min(iw,ih), inner)
+    # Pas de "scale", donc aucune modification de taille du contenu.
+    crop_w = f"min(min(iw,ih),{inner})"
+    crop_h = f"min(min(iw,ih),{inner})"
+    crop_x = f"(iw-{crop_w})/2"
+    crop_y = f"(ih-{crop_h})/2"
+
     vf = (
-        "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
-        f"scale='if(gt(iw,{inner}),{inner},iw)':'if(gt(ih,{inner}),{inner},ih)':flags=bicubic,"
+        f"crop='{crop_w}':'{crop_h}':'{crop_x}':'{crop_y}',"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
         f"fps={fps},setsar=1,format=yuv420p"
     )
@@ -174,7 +179,7 @@ def _mix_voice_with_music(voice_path: str, music_path: str, start_at_sec: int,
 
 # ---------- Génération ----------
 def generate_video(
-    plan: List[Dict[str, Any]],
+    plan: List[Dict,],
     audio_path: str,
     output_name: str,
     temp_dir: str,
@@ -189,7 +194,6 @@ def generate_video(
     music_volume: float = 0.25,
     **kwargs
 ):
-    # Sécurise le style (évite .lower() sur un float)
     style_key = str(style or "default").lower().strip()
 
     parts: List[str] = []
