@@ -1,8 +1,12 @@
-# video_generator.py — encodage standard vs styles externes
+# video_generator.py — encodage standard vs styles externes (carré constant sans downscale)
 import os, time, shutil, subprocess, logging, urllib.request, json, shlex
 from typing import Any, Dict, List, Tuple
 
-from styles import build as build_style  # seulement si style != "default"
+# Laisse le support "styles" si tu veux, mais en pratique passe style="default" pour ce rendu.
+try:
+    from styles import build as build_style  # seulement si style != "default"
+except Exception:
+    build_style = None  # garde le fichier autonome si styles.py n'est pas présent
 
 FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "1").strip()
 FFMPEG_FILTER_THREADS = os.getenv("FFMPEG_FILTER_THREADS", "1").strip()
@@ -63,18 +67,20 @@ def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> 
     logger.info(f"[{req_id}] downloaded (HTTP) -> {dst}")
     return dst
 
-# ---------- Encodage par défaut (aucun style) ----------
+# ---------- Encodage par défaut (carré 1080 constant, SANS DOWNSCALE) ----------
 def _encode_segment_default(src: str, dst: str, need_dur: float, width: int, height: int, fps: int,
                             logger: logging.Logger, req_id: str):
     """
-    AUCUN redimensionnement.
-    1) crop carré centré de taille min(min(iw,ih), inner) -> jamais d'up/downscale
-    2) pad en WxH au centre (bandes noires)
-    3) fps, setsar, yuv420p
+    Objectif: rendu TYPE demandé
+      - carré centré constant (1080x1080 si sortie 1080x1920)
+      - si la source est plus grande : on CROPE au centre (aucun downscale)
+      - si la source est plus petite : on UPSCALE pour remplir le carré (pour éviter l'effet "tout petit")
+      - puis PAD au centre en WxH
+      - fps forcé, yuv420p
     """
-    inner = min(width, height)  # 1080 si sortie 1080x1920
-
+    box = min(width, height)  # 1080 pour 1080x1920
     src_low = src.lower()
+
     if src_low.startswith("http") and ".m3u8" in src_low:
         in_flags = ('-protocol_whitelist "file,http,https,tcp,tls,crypto" '
                     f'-t {need_dur:.3f} -i {shlex.quote(src)}')
@@ -83,18 +89,21 @@ def _encode_segment_default(src: str, dst: str, need_dur: float, width: int, hei
     else:
         in_flags = f'-stream_loop -1 -t {need_dur:.3f} -i {shlex.quote(src)}'
 
-    # Taille du carré recadré = min(min(iw,ih), inner)
-    # Pas de "scale", donc aucune modification de taille du contenu.
-    crop_w = f"min(min(iw,ih),{inner})"
-    crop_h = f"min(min(iw,ih),{inner})"
-    crop_x = f"(iw-{crop_w})/2"
-    crop_y = f"(ih-{crop_h})/2"
-
-    vf = (
-        f"crop='{crop_w}':'{crop_h}':'{crop_x}':'{crop_y}',"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
-        f"fps={fps},setsar=1,format=yuv420p"
-    )
+    # Chaîne de filtres :
+    # 1) setsar=1 pour fiabiliser iw/ih
+    # 2) crop carré S = min(iw,ih) (centré)
+    # 3) re-crop conditionnel à "box" si S > box (donc jamais de downscale)
+    # 4) scale conditionnel d'UPSCALE uniquement si S < box (pour garder un carré constant plein)
+    # 5) pad en WxH centré + fps + format
+    vf = ",".join([
+        "setsar=1",
+        "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2'",
+        f"crop='if(gte(iw,{box}),{box},iw)':'if(gte(ih,{box}),{box},ih)':(iw-out_w)/2:(ih-out_h)/2",
+        f"scale='if(lt(iw,{box}),{box},iw)':'if(lt(ih,{box}),{box},ih)':flags=bicubic",
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black",
+        f"fps={fps}",
+        "format=yuv420p"
+    ])
 
     cmd = (
         "ffmpeg -y -hide_banner -loglevel error "
@@ -105,9 +114,13 @@ def _encode_segment_default(src: str, dst: str, need_dur: float, width: int, hei
     )
     _run(_with_threads(cmd), logger, req_id)
 
-# ---------- Encodage via style (philo, etc.) ----------
+# ---------- Encodage via style (laisse pour compat, mais inutile ici) ----------
 def _encode_segment_with_style(src: str, dst: str, need_dur: float, width: int, height: int, fps: int,
                                style_key: str, logger: logging.Logger, req_id: str, temp_dir: str):
+    if not build_style:
+        # fallback : utilise le défaut si styles.py n'est pas dispo
+        return _encode_segment_default(src, dst, need_dur, width, height, fps, logger, req_id)
+
     src_low = src.lower()
     if src_low.startswith("http") and ".m3u8" in src_low:
         in_flags = ('-protocol_whitelist "file,http,https,tcp,tls,crypto" '
@@ -117,7 +130,6 @@ def _encode_segment_with_style(src: str, dst: str, need_dur: float, width: int, 
     else:
         in_flags = f'-stream_loop -1 -t {need_dur:.3f} -i {shlex.quote(src)}'
 
-    # Récupère (extra_inputs, filter_complex, map_label) auprès du style choisi
     extra_inputs, filter_complex, map_label = build_style(
         style_key, need_dur, width, height, fps, temp_dir
     )
@@ -179,7 +191,7 @@ def _mix_voice_with_music(voice_path: str, music_path: str, start_at_sec: int,
 
 # ---------- Génération ----------
 def generate_video(
-    plan: List[Dict,],
+    plan: List[Dict[str, Any]],
     audio_path: str,
     output_name: str,
     temp_dir: str,
@@ -195,7 +207,6 @@ def generate_video(
     **kwargs
 ):
     style_key = str(style or "default").lower().strip()
-
     parts: List[str] = []
     t_running = 0.0
 
@@ -225,7 +236,7 @@ def generate_video(
 
         # encodage : route default vs styles
         part_path = os.path.join(temp_dir, f"part_{i:03d}.mp4")
-        if style_key and style_key != "default":
+        if style_key and style_key != "default" and build_style is not None:
             _encode_segment_with_style(
                 src_for_encode, part_path, dur, width, height, fps,
                 style_key, logger, req_id, temp_dir
@@ -261,7 +272,7 @@ def generate_video(
         "mode": concat_mode,
         "items": len(parts),
         "style": (style_key or "default"),
-        "effects": ("philo" if style_key == "philo" else ("rounded" if style_key == "rounded" else "none")),
+        "effects": "none",
         "music": bool(music_path),
         "music_start_at": int(music_delay) if music_path else 0,
         "music_volume": float(music_volume) if music_path else 0.0,
