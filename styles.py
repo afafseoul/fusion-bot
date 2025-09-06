@@ -1,73 +1,91 @@
-# styles.py — construit la chaîne de filtres ffmpeg pour un style donné
-import os, shlex
-from typing import Tuple
+# styles.py
+from __future__ import annotations
+from pathlib import Path
+from typing import List, Tuple, Optional
 from PIL import Image, ImageDraw
 
-def build(style_key: str, need_dur: float, width: int, height: int, fps: int, temp_dir: str) -> Tuple[str, str, str]:
-    """
-    Retourne (extra_inputs, filter_complex, map_label)
-      - extra_inputs: options/inputs additionnels à ajouter à la ligne ffmpeg (ex: masque PNG)
-      - filter_complex: la chaîne de filtres complete
-      - map_label: la sortie vidéo à mapper (ex: "[v]")
-    """
-    k = (style_key or "default").lower().strip()
-    inner = min(width, height)
 
-    if k in ("rounded", "round", "coins", "coin"):
-        # Coins arrondis simples
-        mask_path = _ensure_rounded_mask(width, height, radius=48, temp_dir=temp_dir)
-        extra_inputs = f'-loop 1 -t {need_dur:.3f} -i {shlex.quote(mask_path)}'
+def _ensure_mask(path: Path, w: int, h: int, radius: int) -> None:
+    """
+    Crée un PNG en niveaux de gris (alpha) avec un grand rectangle à coins arrondis
+    (blanc = zone visible, noir = coins masqués). On le garde en cache disque.
+    """
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(img)
+    # rectangle arrondi plein
+    draw.rounded_rectangle([(0, 0), (w - 1, h - 1)], radius=radius, fill=255)
+    img.save(path)
+
+
+def build(
+    temp_dir: str,
+    style_key: Optional[str],
+    dur: float,
+    width: int,
+    height: int,
+    fps: int,
+) -> Tuple[List[str], str, str]:
+    """
+    Retourne (extra_inputs, filter_complex, map_label).
+
+    extra_inputs: liste d'arguments d'entrée supplémentaires pour ffmpeg (ex: le mask PNG)
+    filter_complex: la chaîne filter_complex qui mappe vers l'étiquette finale
+    map_label: le label vidéo final (ex: 'v')
+    """
+
+    # Par défaut: aucun style => on laisse la pipeline "default" du générateur faire le taf,
+    # mais on fournit quand même une chaîne simple si l'appelant veut l'utiliser tel quel.
+    if not style_key or style_key.lower() in ("default", "none", "nul", "null"):
+        # pipeline simple (optionnelle) si tu veux l’utiliser directement :
+        # [0:v] crop->scale->pad->fps->yuv420p
+        filter_simple = (
+            "[0:v]"
+            "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
+            f"scale={width}:{width}:flags=bicubic,"  # carré centré
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
+            f"fps={fps},setsar=1,format=yuv420p[v]"
+        )
+        return [], filter_simple, "v"
+
+    # === STYLE: PHILO (léger & rapide sur Render Free) =========================
+    if style_key.lower() == "philo":
+        # Coins arrondis: on prépare un mask PNG (une seule fois)
+        mask_path = Path(temp_dir) / f"rounded_mask_{width}x{height}_r48.png"
+        _ensure_mask(mask_path, width, height, radius=48)
+
+        # Entrée supplémentaire: on boucle le mask à la durée du segment
+        extra_inputs = [
+            "-loop", "1",
+            "-t", f"{dur:.3f}",
+            "-i", str(mask_path)
+        ]
+
+        # Filter minimal (pas de filtres gourmands):
+        # 1) crop/scale en carré (width x width), 2) pad en 1080x1920,
+        # 3) fps/setsar, 4) format rgba, 5) alphamerge avec le mask,
+        # 6) sortie yuv420p
         filter_complex = (
-            # pipeline base -> WxH
-            f"[0:v]"
-            f"crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
-            f"scale={inner}:{inner}:flags=bicubic,"
+            "[0:v]"
+            "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
+            f"scale={width}:{width}:flags=bicubic,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
             f"fps={fps},setsar=1,format=rgba[base];"
-            # masque en N&B
-            f"[1:v]format=gray,scale={width}:{height}[mask];"
-            # fusion alpha + sortie en yuv420p (coins transparents -> noir)
-            f"[base][mask]alphamerge,format=yuv420p[v]"
+            "[1:v]format=gray[mask];"
+            "[base][mask]alphamerge,format=yuv420p[v]"
         )
-        return extra_inputs, filter_complex, "[v]"
 
-    if k == "philo":
-        # Style léger: contraste/saturation + coins arrondis (pas de grain)
-        mask_path = _ensure_rounded_mask(width, height, radius=48, temp_dir=temp_dir)
-        extra_inputs = f'-loop 1 -t {need_dur:.3f} -i {shlex.quote(mask_path)}'
-        filter_complex = (
-            f"[0:v]"
-            f"crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
-            f"scale={inner}:{inner}:flags=bicubic,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"fps={fps},setsar=1,"
-            # léger grade d'image
-            f"eq=contrast=1.06:brightness=0.02:saturation=1.08,"
-            f"unsharp=5:5:0.5:5:5:0.0,"
-            f"format=rgba[base];"
-            f"[1:v]format=gray,scale={width}:{height}[mask];"
-            f"[base][mask]alphamerge,format=yuv420p[v]"
-        )
-        return extra_inputs, filter_complex, "[v]"
+        return extra_inputs, filter_complex, "v"
 
-    # Fallback: pipeline défaut mais via style (au cas où)
-    extra_inputs = ""
-    filter_complex = (
-        f"[0:v]"
-        f"crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
-        f"scale={inner}:{inner}:flags=bicubic,"
+    # === Autres styles (horror, etc.) à ajouter plus tard ======================
+    # Pour l’instant, fallback sur la chaîne simple
+    filter_simple = (
+        "[0:v]"
+        "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
+        f"scale={width}:{width}:flags=bicubic,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
         f"fps={fps},setsar=1,format=yuv420p[v]"
     )
-    return extra_inputs, filter_complex, "[v]"
-
-def _ensure_rounded_mask(width: int, height: int, radius: int, temp_dir: str) -> str:
-    os.makedirs(temp_dir, exist_ok=True)
-    path = os.path.join(temp_dir, f"rounded_mask_{width}x{height}_r{radius}.png")
-    if not os.path.exists(path):
-        img = Image.new("L", (width, height), 0)  # L = 8-bit (grayscale)
-        draw = ImageDraw.Draw(img)
-        # rectangle aux coins arrondis plein (blanc = alpha 1.0)
-        draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=radius, fill=255)
-        img.save(path, "PNG")
-    return path
+    return [], filter_simple, "v"
