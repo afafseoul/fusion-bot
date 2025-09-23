@@ -20,6 +20,13 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 KEEP_TMP  = os.getenv("KEEP_TMP", "1") == "1"
 
+# Fallback global vers ton webhook Make si rien n'est fourni dans la requête
+# (tu peux aussi le surcharger via la variable d'env FINISH_WEBHOOK)
+DEFAULT_FINISH_WEBHOOK = os.getenv(
+    "DEFAULT_FINISH_WEBHOOK_URL",
+    "https://hook.eu2.make.com/5mjade7l6ys678hrwenbtvxc645y2hlx"
+)
+
 app = Flask(__name__)
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 app.logger.setLevel(logging.getLogger().level)
@@ -179,6 +186,24 @@ def _post_finish_webhook(url: str, ok: bool, file_name: str):
         except Exception:
             pass
 
+def _resolve_finish_webhook_from_request(req) -> Optional[str]:
+    """
+    Choisit l’URL de fin:
+      1) champ 'finish_webhook' (form ou query)
+      2) env FINISH_WEBHOOK
+      3) DEFAULT_FINISH_WEBHOOK
+    Valeurs vides/'none' désactivent l’appel.
+    """
+    w = (
+        (req.form.get("finish_webhook") if hasattr(req, "form") else None)
+        or (req.args.get("finish_webhook") if hasattr(req, "args") else None)
+        or os.getenv("FINISH_WEBHOOK")
+        or DEFAULT_FINISH_WEBHOOK
+    )
+    if w and str(w).strip().lower() in ("", "none", "false", "0"):
+        return None
+    return w
+
 # ---------------- SYNC ----------------
 @app.post("/create-video")
 def create_video():
@@ -195,7 +220,7 @@ def create_video():
         music_folder_id = request.form.get("music_folder_id")
         music_volume    = _parse_float(request.form.get("music_volume", 0.25), 0.25)
         drive_folder_id = request.form.get("drive_folder_id") or request.args.get("drive_folder_id")
-        finish_webhook  = request.form.get("finish_webhook") or request.args.get("finish_webhook")
+        finish_webhook  = _resolve_finish_webhook_from_request(request)
 
         app.logger.info(f"[{g.req_id}] fields ok name={output_name} {width}x{height}@{fps} "
                         f"audio={getattr(audio_file,'filename',None)} style={style}")
@@ -288,7 +313,15 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
     workdir = None
     req_id = fields.get("req_id", jid)
     callback_url = fields.get("callback_url")
-    finish_webhook = fields.get("finish_webhook")
+    # même logique de fallback en async
+    finish_webhook = (
+        fields.get("finish_webhook")
+        or os.getenv("FINISH_WEBHOOK")
+        or DEFAULT_FINISH_WEBHOOK
+    )
+    if finish_webhook and str(finish_webhook).strip().lower() in ("", "none", "false", "0"):
+        finish_webhook = None
+
     try:
         with app.app_context():
             g.req_id = req_id
@@ -425,6 +458,7 @@ def create_video_async():
             "audio_path": audio_local,
             "drive_folder_id": request.form.get("drive_folder_id") or request.args.get("drive_folder_id"),
             "callback_url": request.form.get("callback_url"),
+            # On transporte la valeur si fournie; sinon le worker utilisera les fallbacks ENV/DEFAULT
             "finish_webhook": request.form.get("finish_webhook") or request.args.get("finish_webhook"),
             "style": request.form.get("style"),
             "music_folder_id": request.form.get("music_folder_id"),
