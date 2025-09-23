@@ -142,6 +142,43 @@ def _normalize_plan(raw: Any) -> List[Dict[str, Any]]:
 def root():
     return jsonify(ok=True, service="fusion-bot", ts=int(time.time()))
 
+# ---- Helpers callbacks/webhooks ---------------------------------------------
+
+def _post_callback(url: str, payload: Dict[str, Any]):
+    """Callback générique (progress, debug…)."""
+    try:
+        if _requests:
+            _requests.post(url, json=payload, timeout=10)
+        else:
+            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10).read()
+    except Exception:
+        pass
+
+def _post_finish_webhook(url: str, ok: bool, file_name: str):
+    """
+    Webhook demandé: n’envoie QUE { ok: bool, file_name: str }.
+    Utilisé exclusivement à la fin de l’UPLOAD Google Drive.
+    """
+    payload = {"ok": bool(ok), "file_name": str(file_name)}
+    try:
+        if _requests:
+            _requests.post(url, json=payload, timeout=8)
+        else:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=8).read()
+    except Exception as e:
+        # on ne casse pas le flux si le webhook est KO
+        try:
+            app.logger.warning(f"[{getattr(g,'req_id','?')}] finish_webhook failed: {e}")
+        except Exception:
+            pass
+
 # ---------------- SYNC ----------------
 @app.post("/create-video")
 def create_video():
@@ -158,6 +195,7 @@ def create_video():
         music_folder_id = request.form.get("music_folder_id")
         music_volume    = _parse_float(request.form.get("music_volume", 0.25), 0.25)
         drive_folder_id = request.form.get("drive_folder_id") or request.args.get("drive_folder_id")
+        finish_webhook  = request.form.get("finish_webhook") or request.args.get("finish_webhook")
 
         app.logger.info(f"[{g.req_id}] fields ok name={output_name} {width}x{height}@{fps} "
                         f"audio={getattr(audio_file,'filename',None)} style={style}")
@@ -218,9 +256,13 @@ def create_video():
             try:
                 gd = _gdrive_upload(out_path, output_name, drive_folder_id, app.logger, g.req_id)
                 resp.update({"drive_file_id": gd.get("id"), "drive_webViewLink": gd.get("webViewLink")})
+                if finish_webhook:
+                    _post_finish_webhook(finish_webhook, True, output_name)
             except Exception as e:
                 app.logger.exception(f"[{g.req_id}] drive upload failed: {e}")
                 resp["drive_error"] = str(e)
+                if finish_webhook:
+                    _post_finish_webhook(finish_webhook, False, output_name)
 
         return jsonify(resp)
 
@@ -242,21 +284,11 @@ def _set_job(jid: str, **kw):
     with JLOCK:
         JOBS[jid] = {**JOBS.get(jid, {}), **kw}
 
-def _post_callback(url: str, payload: Dict[str, Any]):
-    try:
-        if _requests:
-            _requests.post(url, json=payload, timeout=10)
-        else:
-            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
-                                         headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=10).read()
-    except Exception:
-        pass
-
 def _worker_create_video(jid: str, fields: Dict[str, Any]):
     workdir = None
     req_id = fields.get("req_id", jid)
     callback_url = fields.get("callback_url")
+    finish_webhook = fields.get("finish_webhook")
     try:
         with app.app_context():
             g.req_id = req_id
@@ -344,9 +376,13 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
                         "drive_file_id": gd.get("id"),
                         "drive_webViewLink": gd.get("webViewLink"),
                     })
+                    if finish_webhook:
+                        _post_finish_webhook(finish_webhook, True, output_name)
                 except Exception as e:
                     app.logger.exception(f"[{req_id}] drive upload failed: {e}")
                     result["drive_error"] = str(e)
+                    if finish_webhook:
+                        _post_finish_webhook(finish_webhook, False, output_name)
 
             _set_job(jid, **result)
             if callback_url:
@@ -359,6 +395,8 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
         if callback_url:
             try: _post_callback(callback_url, {"job_id": jid, **err})
             except Exception: pass
+        # En cas d’erreur avant l’upload Drive, on ne déclenche PAS le finish_webhook,
+        # car la consigne est “uniquement quand l’upload est terminé”.
     finally:
         try:
             if not KEEP_TMP and os.getenv("CLEAN_TMP") == "1" and workdir and os.path.isdir(workdir):
@@ -387,6 +425,7 @@ def create_video_async():
             "audio_path": audio_local,
             "drive_folder_id": request.form.get("drive_folder_id") or request.args.get("drive_folder_id"),
             "callback_url": request.form.get("callback_url"),
+            "finish_webhook": request.form.get("finish_webhook") or request.args.get("finish_webhook"),
             "style": request.form.get("style"),
             "music_folder_id": request.form.get("music_folder_id"),
             "music_volume": request.form.get("music_volume"),
