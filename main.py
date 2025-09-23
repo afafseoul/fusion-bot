@@ -163,12 +163,12 @@ def _post_callback(url: str, payload: Dict[str, Any]):
     except Exception:
         pass
 
-def _post_finish_webhook(url: str, ok: bool, file_name: str):
+def _post_finish_webhook(url: str, ok: bool, file_name: str, compte: Optional[str] = None):
     """
-    Webhook demandé: n’envoie QUE { ok: bool, file_name: str }.
-    Utilisé exclusivement à la fin de l’UPLOAD Google Drive.
+    Webhook final : n’envoie QUE { ok, file_name, compte }.
+    Déclenché EXCLUSIVEMENT quand l’upload Google Drive se termine.
     """
-    payload = {"ok": bool(ok), "file_name": str(file_name)}
+    payload = {"ok": bool(ok), "file_name": str(file_name), "compte": (compte or "")}
     try:
         if _requests:
             _requests.post(url, json=payload, timeout=8)
@@ -221,6 +221,8 @@ def create_video():
         music_volume    = _parse_float(request.form.get("music_volume", 0.25), 0.25)
         drive_folder_id = request.form.get("drive_folder_id") or request.args.get("drive_folder_id")
         finish_webhook  = _resolve_finish_webhook_from_request(request)
+        # 🆕 compte (nom du compte) passé par Make dans les inputs
+        compte          = request.form.get("compte") or request.args.get("compte")
 
         app.logger.info(f"[{g.req_id}] fields ok name={output_name} {width}x{height}@{fps} "
                         f"audio={getattr(audio_file,'filename',None)} style={style}")
@@ -282,12 +284,12 @@ def create_video():
                 gd = _gdrive_upload(out_path, output_name, drive_folder_id, app.logger, g.req_id)
                 resp.update({"drive_file_id": gd.get("id"), "drive_webViewLink": gd.get("webViewLink")})
                 if finish_webhook:
-                    _post_finish_webhook(finish_webhook, True, output_name)
+                    _post_finish_webhook(finish_webhook, True, output_name, compte)
             except Exception as e:
                 app.logger.exception(f"[{g.req_id}] drive upload failed: {e}")
                 resp["drive_error"] = str(e)
                 if finish_webhook:
-                    _post_finish_webhook(finish_webhook, False, output_name)
+                    _post_finish_webhook(finish_webhook, False, output_name, compte)
 
         return jsonify(resp)
 
@@ -337,6 +339,8 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
             drive_folder_id = fields.get("drive_folder_id")
             music_folder_id = fields.get("music_folder_id")
             music_volume    = _parse_float(fields.get("music_volume", 0.25), 0.25)
+            # 🆕 compte dans le worker asynchrone
+            compte          = fields.get("compte")
 
             app.logger.info(f"[{req_id}] (async) start job {jid} name={output_name} "
                             f"{width}x{height}@{fps} style={style}")
@@ -410,12 +414,12 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
                         "drive_webViewLink": gd.get("webViewLink"),
                     })
                     if finish_webhook:
-                        _post_finish_webhook(finish_webhook, True, output_name)
+                        _post_finish_webhook(finish_webhook, True, output_name, compte)
                 except Exception as e:
                     app.logger.exception(f"[{req_id}] drive upload failed: {e}")
                     result["drive_error"] = str(e)
                     if finish_webhook:
-                        _post_finish_webhook(finish_webhook, False, output_name)
+                        _post_finish_webhook(finish_webhook, False, output_name, compte)
 
             _set_job(jid, **result)
             if callback_url:
@@ -463,6 +467,8 @@ def create_video_async():
             "style": request.form.get("style"),
             "music_folder_id": request.form.get("music_folder_id"),
             "music_volume": request.form.get("music_volume"),
+            # 🆕 on met aussi 'compte' dans la file pour l'async
+            "compte": request.form.get("compte") or request.args.get("compte"),
         }
 
         _set_job(jid, status="queued", job_id=jid, req_id=req_id, enqueued_at=int(time.time()))
