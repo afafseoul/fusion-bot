@@ -40,7 +40,6 @@ def _gdrive_service():
     path = os.getenv("GOOGLE_CREDS", "/etc/secrets/credentials.json")
     scopes = ["https://www.googleapis.com/auth/drive"]
     owner_email = os.getenv("OWNER_EMAIL", "ktrium@wwwjeneveuxpastravailler.com")
-    # <- impersonation via subject=owner_email (DWD doit être activée côté Admin)
     creds = Credentials.from_service_account_file(path, scopes=scopes, subject=owner_email)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 # --------------------------------------------------------------------
@@ -171,12 +170,16 @@ def _post_callback(url: str, payload: Dict[str, Any]):
     except Exception:
         pass
 
-def _post_finish_webhook(url: str, ok: bool, file_name: str, compte: Optional[str] = None):
+def _post_finish_webhook(url: str, ok: bool, file_name: str, compte: Optional[str] = None, contenue: Optional[str] = None):
     """
-    Webhook final : n’envoie QUE { ok, file_name, compte }.
+    Webhook final : envoie { ok, file_name, compte } + éventuellement { Contenue }.
     Déclenché EXCLUSIVEMENT quand l’upload Google Drive se termine.
     """
     payload = {"ok": bool(ok), "file_name": str(file_name), "compte": (compte or "")}
+    # ➕ nouvel item facultatif exactement nommé "Contenue"
+    if contenue is not None:
+        payload["Contenue"] = contenue
+
     try:
         if _requests:
             _requests.post(url, json=payload, timeout=8)
@@ -188,7 +191,6 @@ def _post_finish_webhook(url: str, ok: bool, file_name: str, compte: Optional[st
             )
             urllib.request.urlopen(req, timeout=8).read()
     except Exception as e:
-        # on ne casse pas le flux si le webhook est KO
         try:
             app.logger.warning(f"[{getattr(g,'req_id','?')}] finish_webhook failed: {e}")
         except Exception:
@@ -231,6 +233,8 @@ def create_video():
         finish_webhook  = _resolve_finish_webhook_from_request(request)
         # 🆕 compte (nom du compte) passé par Make dans les inputs
         compte          = request.form.get("compte") or request.args.get("compte")
+        # 🆕 narration passée depuis Make (clé exactement "Contenue")
+        contenue        = request.form.get("Contenue") or request.args.get("Contenue")
 
         app.logger.info(f"[{g.req_id}] fields ok name={output_name} {width}x{height}@{fps} "
                         f"audio={getattr(audio_file,'filename',None)} style={style}")
@@ -292,12 +296,12 @@ def create_video():
                 gd = _gdrive_upload(out_path, output_name, drive_folder_id, app.logger, g.req_id)
                 resp.update({"drive_file_id": gd.get("id"), "drive_webViewLink": gd.get("webViewLink")})
                 if finish_webhook:
-                    _post_finish_webhook(finish_webhook, True, output_name, compte)
+                    _post_finish_webhook(finish_webhook, True, output_name, compte, contenue)
             except Exception as e:
                 app.logger.exception(f"[{g.req_id}] drive upload failed: {e}")
                 resp["drive_error"] = str(e)
                 if finish_webhook:
-                    _post_finish_webhook(finish_webhook, False, output_name, compte)
+                    _post_finish_webhook(finish_webhook, False, output_name, compte, contenue)
 
         return jsonify(resp)
 
@@ -323,7 +327,6 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
     workdir = None
     req_id = fields.get("req_id", jid)
     callback_url = fields.get("callback_url")
-    # même logique de fallback en async
     finish_webhook = (
         fields.get("finish_webhook")
         or os.getenv("FINISH_WEBHOOK")
@@ -347,8 +350,8 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
             drive_folder_id = fields.get("drive_folder_id")
             music_folder_id = fields.get("music_folder_id")
             music_volume    = _parse_float(fields.get("music_volume", 0.25), 0.25)
-            # 🆕 compte dans le worker asynchrone
             compte          = fields.get("compte")
+            contenue        = fields.get("Contenue")  # 🆕
 
             app.logger.info(f"[{req_id}] (async) start job {jid} name={output_name} "
                             f"{width}x{height}@{fps} style={style}")
@@ -422,12 +425,12 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
                         "drive_webViewLink": gd.get("webViewLink"),
                     })
                     if finish_webhook:
-                        _post_finish_webhook(finish_webhook, True, output_name, compte)
+                        _post_finish_webhook(finish_webhook, True, output_name, compte, contenue)
                 except Exception as e:
                     app.logger.exception(f"[{req_id}] drive upload failed: {e}")
                     result["drive_error"] = str(e)
                     if finish_webhook:
-                        _post_finish_webhook(finish_webhook, False, output_name, compte)
+                        _post_finish_webhook(finish_webhook, False, output_name, compte, contenue)
 
             _set_job(jid, **result)
             if callback_url:
@@ -440,8 +443,6 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
         if callback_url:
             try: _post_callback(callback_url, {"job_id": jid, **err})
             except Exception: pass
-        # En cas d’erreur avant l’upload Drive, on ne déclenche PAS le finish_webhook,
-        # car la consigne est “uniquement quand l’upload est terminé”.
     finally:
         try:
             if not KEEP_TMP and os.getenv("CLEAN_TMP") == "1" and workdir and os.path.isdir(workdir):
@@ -470,13 +471,13 @@ def create_video_async():
             "audio_path": audio_local,
             "drive_folder_id": request.form.get("drive_folder_id") or request.args.get("drive_folder_id"),
             "callback_url": request.form.get("callback_url"),
-            # On transporte la valeur si fournie; sinon le worker utilisera les fallbacks ENV/DEFAULT
             "finish_webhook": request.form.get("finish_webhook") or request.args.get("finish_webhook"),
             "style": request.form.get("style"),
             "music_folder_id": request.form.get("music_folder_id"),
             "music_volume": request.form.get("music_volume"),
-            # 🆕 on met aussi 'compte' dans la file pour l'async
             "compte": request.form.get("compte") or request.args.get("compte"),
+            # 🆕 on transporte tel-quel la narration "Contenue" pour l’async
+            "Contenue": request.form.get("Contenue") or request.args.get("Contenue"),
         }
 
         _set_job(jid, status="queued", job_id=jid, req_id=req_id, enqueued_at=int(time.time()))
