@@ -31,11 +31,19 @@ app = Flask(__name__)
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 app.logger.setLevel(logging.getLogger().level)
 
+# -------------------- CORRECTION (impersonation) --------------------
 def _gdrive_service():
+    """
+    Utilise le Service Account avec Domain-Wide Delegation pour créer les fichiers
+    AU NOM de l'utilisateur Workspace (owner_email).
+    """
     path = os.getenv("GOOGLE_CREDS", "/etc/secrets/credentials.json")
     scopes = ["https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_file(path, scopes=scopes)
+    owner_email = os.getenv("OWNER_EMAIL", "ktrium@wwwjeneveuxpastravailler.com")
+    # <- impersonation via subject=owner_email (DWD doit être activée côté Admin)
+    creds = Credentials.from_service_account_file(path, scopes=scopes, subject=owner_email)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
+# --------------------------------------------------------------------
 
 def _gdrive_upload(file_path: str, file_name: str, folder_id: Optional[str], logger, req_id: str):
     svc = _gdrive_service()
