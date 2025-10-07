@@ -25,12 +25,12 @@ def start():
         print("\n📥 Requête reçue...")
         print(f"✅ Données JSON reçues : {data}")
 
-        # -------------------- CORRECTION (impersonation) --------------------
+        # Impersonation via DWD
         try:
             owner_email = os.getenv("OWNER_EMAIL", "ktrium@wwwjeneveuxpastravailler.com")
             creds = service_account.Credentials.from_service_account_file(
                 "/etc/secrets/credentials.json", scopes=SCOPES
-            ).with_subject(owner_email)  # impersonation via DWD
+            ).with_subject(owner_email)
             drive_service = build("drive", "v3", credentials=creds)
             print("✅ Connexion à Google Drive (impersonation) réussie")
         except FileNotFoundError:
@@ -41,7 +41,6 @@ def start():
             if "invalid_grant" in str(e):
                 return jsonify({"error": "Clé invalide : vérifie la date de création ou si elle est désactivée"}), 401
             return jsonify({"error": f"Erreur inattendue avec les identifiants : {str(e)}"}), 500
-        # -------------------------------------------------------------------
 
         # Recherche du dossier client
         response = drive_service.files().list(
@@ -57,7 +56,7 @@ def start():
         client_folder_id = folders[0]['id']
         print(f"📁 Dossier du client trouvé : {client_folder_id}")
 
-        # Recherche du sous-dossier Post-Video-AddMusic
+        # Sous-dossier Post-Video-AddMusic
         subfolder_response = drive_service.files().list(
             q=f"name='Post-Video-AddMusic' and '{client_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
             spaces='drive',
@@ -70,7 +69,7 @@ def start():
 
         subfolder_id = subfolders[0]['id']
 
-        # Recherche de la vidéo dans le sous-dossier
+        # Fichier vidéo
         video_response = drive_service.files().list(
             q=f"name='{video_name}' and '{subfolder_id}' in parents",
             spaces='drive',
@@ -84,16 +83,15 @@ def start():
         video_file = video_files[0]
         video_id = video_file['id']
 
-        # Téléchargement de la vidéo
+        # Download vidéo
         video_path = f"temp_{video_name}"
         request_video = drive_service.files().get_media(fileId=video_id, supportsAllDrives=True)
         with open(video_path, "wb") as f:
             downloader = drive_service._http.request(request_video.uri)
             f.write(downloader[1])
-
         print(f"📥 Vidéo téléchargée : {video_path}")
 
-        # Choix d'une musique aléatoire
+        # Musique aléatoire
         music_folder_response = drive_service.files().list(
             q=f"name='Music' and '{client_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
             spaces='drive',
@@ -123,10 +121,9 @@ def start():
         with open(music_path, "wb") as f:
             downloader = drive_service._http.request(request_music.uri)
             f.write(downloader[1])
-
         print(f"🎵 Musique sélectionnée : {music_name}")
 
-        # Appliquer le décalage si présent dans le nom (ex: musique@55.mp3)
+        # Décalage via "@NN"
         delay = 0
         if "@" in music_name:
             try:
@@ -138,9 +135,7 @@ def start():
         output_path = f"final_{video_name}"
         video_input = ffmpeg.input(video_path)
         music_input = ffmpeg.input(music_path, ss=delay)
-
         ffmpeg.output(video_input, music_input, output_path, shortest=None, vcodec='copy', acodec='aac').run(overwrite_output=True)
-
         print(f"✅ Fusion terminée : {output_path}")
 
         # Upload dans ReadyToPost
@@ -162,9 +157,8 @@ def start():
             body=file_metadata,
             media_body=media,
             fields='id',
-            supportsAllDrives=True  # important si dossier en Drive partagé
+            supportsAllDrives=True
         ).execute()
-
         print(f"🚀 Vidéo finale uploadée : {output_path}")
 
         # Nettoyage
