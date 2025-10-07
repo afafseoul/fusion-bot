@@ -25,12 +25,14 @@ def start():
         print("\n📥 Requête reçue...")
         print(f"✅ Données JSON reçues : {data}")
 
+        # -------------------- CORRECTION (impersonation) --------------------
         try:
+            owner_email = os.getenv("OWNER_EMAIL", "ktrium@wwwjeneveuxpastravailler.com")
             creds = service_account.Credentials.from_service_account_file(
                 "/etc/secrets/credentials.json", scopes=SCOPES
-            )
+            ).with_subject(owner_email)  # impersonation via DWD
             drive_service = build("drive", "v3", credentials=creds)
-            print("✅ Connexion à Google Drive réussie")
+            print("✅ Connexion à Google Drive (impersonation) réussie")
         except FileNotFoundError:
             return jsonify({"error": "Fichier credentials.json introuvable sur Render"}), 500
         except ValueError as e:
@@ -39,12 +41,14 @@ def start():
             if "invalid_grant" in str(e):
                 return jsonify({"error": "Clé invalide : vérifie la date de création ou si elle est désactivée"}), 401
             return jsonify({"error": f"Erreur inattendue avec les identifiants : {str(e)}"}), 500
+        # -------------------------------------------------------------------
 
         # Recherche du dossier client
         response = drive_service.files().list(
             q=f"name='{client}' and mimeType='application/vnd.google-apps.folder' and '{DRIVE_FOLDER_ID}' in parents",
             spaces='drive',
-            fields='files(id, name)'
+            fields='files(id, name)',
+            includeItemsFromAllDrives=True, supportsAllDrives=True
         ).execute()
         folders = response.get('files', [])
         if not folders:
@@ -57,7 +61,8 @@ def start():
         subfolder_response = drive_service.files().list(
             q=f"name='Post-Video-AddMusic' and '{client_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
             spaces='drive',
-            fields='files(id, name)'
+            fields='files(id, name)',
+            includeItemsFromAllDrives=True, supportsAllDrives=True
         ).execute()
         subfolders = subfolder_response.get('files', [])
         if not subfolders:
@@ -69,7 +74,8 @@ def start():
         video_response = drive_service.files().list(
             q=f"name='{video_name}' and '{subfolder_id}' in parents",
             spaces='drive',
-            fields='files(id, name)'
+            fields='files(id, name)',
+            includeItemsFromAllDrives=True, supportsAllDrives=True
         ).execute()
         video_files = video_response.get('files', [])
         if not video_files:
@@ -80,7 +86,7 @@ def start():
 
         # Téléchargement de la vidéo
         video_path = f"temp_{video_name}"
-        request_video = drive_service.files().get_media(fileId=video_id)
+        request_video = drive_service.files().get_media(fileId=video_id, supportsAllDrives=True)
         with open(video_path, "wb") as f:
             downloader = drive_service._http.request(request_video.uri)
             f.write(downloader[1])
@@ -91,7 +97,8 @@ def start():
         music_folder_response = drive_service.files().list(
             q=f"name='Music' and '{client_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
             spaces='drive',
-            fields='files(id, name)'
+            fields='files(id, name)',
+            includeItemsFromAllDrives=True, supportsAllDrives=True
         ).execute()
         music_folders = music_folder_response.get('files', [])
         if not music_folders:
@@ -101,7 +108,8 @@ def start():
         music_files_response = drive_service.files().list(
             q=f"'{music_folder_id}' in parents and mimeType contains 'audio'",
             spaces='drive',
-            fields='files(id, name)'
+            fields='files(id, name)',
+            includeItemsFromAllDrives=True, supportsAllDrives=True
         ).execute()
         music_files = music_files_response.get('files', [])
         if not music_files:
@@ -111,7 +119,7 @@ def start():
         music_name = music_file['name']
         music_id = music_file['id']
         music_path = f"temp_{music_name}"
-        request_music = drive_service.files().get_media(fileId=music_id)
+        request_music = drive_service.files().get_media(fileId=music_id, supportsAllDrives=True)
         with open(music_path, "wb") as f:
             downloader = drive_service._http.request(request_music.uri)
             f.write(downloader[1])
@@ -139,7 +147,8 @@ def start():
         ready_folder_response = drive_service.files().list(
             q=f"name='ReadyToPost' and '{client_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'",
             spaces='drive',
-            fields='files(id, name)'
+            fields='files(id, name)',
+            includeItemsFromAllDrives=True, supportsAllDrives=True
         ).execute()
         ready_folders = ready_folder_response.get('files', [])
         if not ready_folders:
@@ -149,7 +158,12 @@ def start():
 
         file_metadata = {"name": output_path, "parents": [ready_folder_id]}
         media = MediaFileUpload(output_path, mimetype='video/mp4')
-        drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id',
+            supportsAllDrives=True  # important si dossier en Drive partagé
+        ).execute()
 
         print(f"🚀 Vidéo finale uploadée : {output_path}")
 
