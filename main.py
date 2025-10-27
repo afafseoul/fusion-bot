@@ -135,22 +135,121 @@ def _parse_float(s: Any, default: float) -> float:
     except Exception: return default
 
 def _normalize_plan(raw: Any) -> List[Dict[str, Any]]:
-    if isinstance(raw, (bytes, bytearray)): raw = raw.decode("utf-8","ignore")
+    """
+    Accepte:
+      - un string JSON (objet avec {"plan":[...]} ou directement un array [...]),
+      - un dict (avec clé "plan" ou directement la liste),
+      - une liste de segments.
+    BONUS compat:
+      - si "duration" est manquant mais qu'on a start_time/end_time -> on le calcule,
+      - si "gif_url" est manquant mais qu'on a url/video_url -> on mappe,
+      - si "subtitles" contient " | " (nouveau plan), on ne garde que le timestamp avant " | ".
+    L'API et le comportement restent identiques pour le reste du code.
+    """
+    # 1) Normaliser le type d'entrée
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "ignore")
+
     if isinstance(raw, str):
+        txt = raw.strip()
+        # Log debug optionnel
         try:
             if LOG_LEVEL == "DEBUG":
-                app.logger.info(f"[{g.req_id}] plan_len={len(raw)} head={raw[:400].replace(chr(10),' ')}")
-        except Exception: pass
+                app.logger.info(f"[{getattr(g,'req_id','?')}] plan_len={len(txt)} head={txt[:400].replace(chr(10),' ')}")
+        except Exception:
+            pass
+
+        # Essai direct
         try:
-            raw = json.loads(raw)
+            raw = json.loads(txt)
         except json.JSONDecodeError:
-            last = raw.rfind("}")
-            if last != -1: raw = json.loads(raw[:last+1])
-            else: raise
-    if isinstance(raw, dict) and "plan" in raw: raw = raw["plan"]
-    if not isinstance(raw, list): raise ValueError("plan must be a JSON array")
-    if not raw: raise ValueError("plan is empty")
-    return raw
+            # Tolérance: tenter d'extraire un objet { ... } ou un array [ ... ] imbriqué dans du bruit
+            obj_s, arr_s = None, None
+            lcur, rcur = txt.find("{"), txt.rfind("}")
+            lbrk, rbrk = txt.find("["), txt.rfind("]")
+            if lcur != -1 and rcur != -1 and rcur > lcur:
+                candidate = txt[lcur:rcur+1]
+                try:
+                    obj_s = json.loads(candidate)
+                except Exception:
+                    obj_s = None
+            if obj_s is None and lbrk != -1 and rbrk != -1 and rbrk > lbrk:
+                candidate = txt[lbrk:rbrk+1]
+                try:
+                    arr_s = json.loads(candidate)
+                except Exception:
+                    arr_s = None
+            if obj_s is not None:
+                raw = obj_s
+            elif arr_s is not None:
+                raw = arr_s
+            else:
+                # dernier filet de sécurité: tronquer à la dernière '}'
+                last = txt.rfind("}")
+                if last != -1:
+                    raw = json.loads(txt[:last+1])
+                else:
+                    raise
+
+    # 2) Dégager la liste de segments
+    if isinstance(raw, dict) and "plan" in raw:
+        segments = raw["plan"]
+    elif isinstance(raw, list):
+        segments = raw
+    elif isinstance(raw, dict):
+        segments = [raw]
+    else:
+        raise ValueError("plan must be JSON (object with 'plan' or array of segments)")
+
+    if not isinstance(segments, list):
+        raise ValueError("plan must be a JSON array")
+    if not segments:
+        raise ValueError("plan is empty")
+
+    # 3) Normalisation douce (ancien + nouveau format)
+    out: List[Dict[str, Any]] = []
+    for i, seg in enumerate(segments):
+        if not isinstance(seg, dict):
+            continue
+        s = dict(seg)  # copie
+
+        # url fallback (gif_url prioritaire, sinon url/video_url/source_url)
+        if not s.get("gif_url"):
+            for alt in ("url", "video_url", "source_url"):
+                v = s.get(alt)
+                if isinstance(v, str) and v:
+                    s["gif_url"] = v
+                    break
+
+        # duration depuis end_time/start_time si absent/non valide
+        try:
+            d = float(s.get("duration")) if s.get("duration") is not None else None
+        except Exception:
+            d = None
+        if d is None or d <= 0:
+            st = s.get("start_time")
+            et = s.get("end_time")
+            try:
+                if st is not None and et is not None:
+                    s["duration"] = max(0.0, float(et) - float(st))
+            except Exception:
+                pass
+
+        # subtitles: ne garder que la partie "timestamp --> timestamp" si " | " présent
+        subs = s.get("subtitles")
+        if isinstance(subs, list):
+            clean = []
+            for line in subs:
+                if isinstance(line, str):
+                    clean.append(line.split(" | ", 1)[0].strip())
+            s["subtitles"] = clean
+
+        out.append(s)
+
+    if not out:
+        raise ValueError("plan is empty after normalization")
+
+    return out
 
 @app.get("/")
 def root():
