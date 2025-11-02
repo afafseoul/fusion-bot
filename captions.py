@@ -1,140 +1,118 @@
-# captions.py — SRT classique OU JSON { "words": [...] } -> ASS
+# captions.py — INPUT: srt_text = array "brut" words[] (Make)
+# words[] = [{ "word": "as", "start": 3.12, "end": 3.40 }, ...]
 from dataclasses import dataclass
-import re, html, json
+import html, json, ast, re
 
 @dataclass
 class CapStyle:
-    name: str
+    name: str = "default"
     font: str = "DejaVu Sans"
-    size: int = 72           # plus gros
+    size: int = 64
     outline: int = 4
     shadow: int = 2
-    align: int = 5           # centre absolu
-    margin_v: int = 0
-    primary: str = "&H00FFFFFF&"   # blanc (autres mots)
-    active:  str = "&H0033CCFF&"   # jaune/orangé (mot courant)
-    back:    str = "&H80000000&"   # fond (bordures)
+    align: int = 2           # 2 = bas centre
+    margin_v: int = 120
+    primary: str = "&H00FFFFFF&"   # blanc
+    active:  str = "&H0000FFFF&"   # jaune
+    back:    str = "&H80000000&"
 
-PRESETS = {
-    "default": CapStyle(name="default"),
-}
+STYLE = CapStyle()
 
-ASS_HEADER_TMPL = """[Script Info]
+ASS_HEADER = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
 
 [V4+ Styles]
 Format: Name,Fontname,Fontsize,PrimaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-Style: {name},{font},{size},{primary},&H00000000,{back},-1,0,0,0,100,100,0,0,1,{outline},{shadow},{align},60,60,{margin_v},1
+Style: {STYLE.name},{STYLE.font},{STYLE.size},{STYLE.primary},&H00000000,{STYLE.back},-1,0,0,0,100,100,0,0,1,{STYLE.outline},{STYLE.shadow},{STYLE.align},60,60,{STYLE.margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Text
 """
 
 def _ass_time(t: float) -> str:
-    t = max(0.0, float(t))
+    if t < 0: t = 0.0
     h = int(t // 3600); t -= 3600*h
     m = int(t // 60);   t -= 60*m
     s = int(t)
-    cs = int(round((t - s)*100))
+    cs = int(round((t - s) * 100))
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
-def _srt_blocks(srt_text: str):
-    return re.split(r"\n\s*\n", srt_text.strip(), flags=re.MULTILINE)
+def _escape(text: str) -> str:
+    text = html.unescape(text or "")
+    return text.replace("{", r"\{").replace("}", r"\}")
 
-def _escape_ass(s: str) -> str:
-    s = html.unescape(str(s))
-    return s.replace("{", r"\{").replace("}", r"\}")
-
-# ---------- Mode SRT classique ----------
-def srt_to_ass_lines(srt_text: str, style: CapStyle) -> str:
-    out = []
-    for b in _srt_blocks(srt_text):
-        m = re.search(r"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})", b)
-        if not m:
-            continue
-        hh1,mm1,ss1,ms1, hh2,mm2,ss2,ms2 = m.groups()
-        start = int(hh1)*3600+int(mm1)*60+int(ss1)+int(ms1)/1000.0
-        end   = int(hh2)*3600+int(mm2)*60+int(ss2)+int(ms2)/1000.0
-
-        lines = [ln for ln in b.strip().splitlines() if ln.strip()]
-        # drop index + time line
-        if lines and lines[0].strip().isdigit(): lines = lines[1:]
-        if lines and "-->" in lines[0]: lines = lines[1:]
-        if not lines: continue
-
-        text = _escape_ass(" ".join(lines))
-        out.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},{style.name},{{\\an{style.align}}}{text}")
-    return "\n".join(out)
-
-# ---------- Mode JSON "words" (fenêtre glissante + highlight) ----------
-def words_json_to_ass(words_json: str, style: CapStyle, window_size: int = 5) -> str:
+def _parse_words(payload: str):
+    """payload = string de l'array words[] venu de Make (JSON ou repr Python)."""
+    if not payload: return []
+    txt = payload.strip()
+    # 1) JSON strict
     try:
-        data = json.loads(words_json)
-        words = data["words"]
+        obj = json.loads(txt)
+        if isinstance(obj, list): return _clean(obj)
     except Exception:
-        # Pas JSON valide -> on retombe en SRT normal
-        return srt_to_ass_lines(words_json, style)
+        pass
+    # 2) literal_eval (repr Python typique de Make)
+    try:
+        obj = ast.literal_eval(txt)
+        if isinstance(obj, list): return _clean(obj)
+    except Exception:
+        pass
+    # 3) Tolérance minimale (sécurité)
+    pairs = re.findall(r"word['\"]?\s*:\s*['\"]([^'^\"]+)['\"].*?start['\"]?\s*:\s*([0-9.]+).*?end['\"]?\s*:\s*([0-9.]+)",
+                       txt, flags=re.I|re.S)
+    return _clean([{"word":w, "start":float(s), "end":float(e)} for (w,s,e) in pairs])
 
-    out_lines = []
-    n = len(words)
-    # normaliser
-    seq = []
-    for w in words:
+def _clean(arr):
+    out = []
+    for w in arr:
         try:
             word = str(w.get("word","")).strip()
+            st   = float(w.get("start", 0.0))
+            en   = float(w.get("end",   st + 0.05))
             if not word: continue
-            start = float(w.get("start"))
-            end   = float(w.get("end"))
-            if end <= start: end = start + 0.05
-            seq.append((word, start, end))
+            if en <= st: en = st + 0.05
+            out.append({"word": word, "start": st, "end": en})
         except Exception:
             continue
+    # tri défensif
+    out.sort(key=lambda x: (x["start"], x["end"]))
+    return out
 
-    # Pour chaque mot i, on crée un "événement" ASS couvrant [start_i, end_i]
-    # Texte = derniers (window_size-1) mots + mot courant, avec le courant en couleur active + gras
-    # On évite les retours à la ligne pour limiter les sauts.
-    for i, (word, s, e) in enumerate(seq):
-        start_i, end_i = s, e
-        left = max(0, i - (window_size - 1))
-        visible = [w for (w, _, _) in seq[left:i]]   # anciens
-        before = " ".join(visible)
-        before = _escape_ass(before)
+def _window_line(words, i, window=5):
+    a = max(0, i - (window - 1))
+    chunk = []
+    for j, w in enumerate(words[a:i+1]):
+        tok = _escape(w["word"])
+        if j == len(words[a:i+1]) - 1:    # mot courant
+            chunk.append(f"{{\\c{STYLE.active}\\b1}}{tok}{{\\c{STYLE.primary}\\b0}}")
+        else:
+            chunk.append(tok)
+    return " ".join(chunk)
 
-        active = _escape_ass(word)
-        # autres (blanc) / actif (jaune, gras)
-        txt_parts = []
-        if before:
-            txt_parts.append(r"{\1c" + style.primary + r"\b0}" + before + " ")
-        txt_parts.append(r"{\1c" + style.active + r"\b1}" + active + r"{\b0}")
-        # Pas d’anticipation du mot suivant -> moins de jitter
+def build_ass_from_srt(srt_text: str, preset: str = "default") -> str:
+    """
+    Signature conservée pour main.py.
+    Interprète srt_text comme ARRAY words[] (pas de SRT).
+    """
+    words = _parse_words(srt_text or "")
+    if not words:
+        return ASS_HEADER  # pas de sous-titres si vide
 
-        joined = "".join(txt_parts)
-        ass_text = f"{{\\an{style.align}}}{joined}"
-        out_lines.append(f"Dialogue: 0,{_ass_time(start_i)},{_ass_time(end_i)},{style.name},{ass_text}")
+    # crée une ligne par mot, sans chevauchement visuel
+    lines = []
+    n = len(words)
+    for i, w in enumerate(words):
+        st = w["start"]
+        # borne l'affichage à juste avant le mot suivant (évite les empilements)
+        if i < n - 1:
+            en = min(w["end"], words[i+1]["start"] - 0.01)
+            if en <= st: en = st + 0.03
+        else:
+            en = w["end"]
 
-    return "\n".join(out_lines)
+        text = _window_line(words, i, window=5)
+        lines.append(f"Dialogue: 0,{_ass_time(st)},{_ass_time(en)},{STYLE.name},{{\\an{STYLE.align}}}{text}")
 
-def build_ass_from_srt(srt_or_json: str, preset: str = "default") -> str:
-    st = PRESETS.get((preset or "default").strip().lower(), PRESETS["default"])
-    header = ASS_HEADER_TMPL.format(
-        name=st.name, font=st.font, size=st.size,
-        primary=st.primary, back=st.back, outline=st.outline, shadow=st.shadow,
-        align=st.align, margin_v=st.margin_v
-    )
-
-    # Détection JSON { "words": [...] }
-    is_json = False
-    try:
-        obj = json.loads(srt_or_json)
-        is_json = isinstance(obj, dict) and "words" in obj
-    except Exception:
-        is_json = False
-
-    if is_json:
-        body = words_json_to_ass(srt_or_json, st, window_size=5)
-    else:
-        body = srt_to_ass_lines(srt_or_json, st)
-
-    return header + body
+    return ASS_HEADER + "\n".join(lines)
