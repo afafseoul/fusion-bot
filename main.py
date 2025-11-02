@@ -12,6 +12,7 @@ except Exception:
 import urllib.request, urllib.error
 
 from video_generator import generate_video
+from captions import build_ass_from_srt
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -29,7 +30,18 @@ DEFAULT_FINISH_WEBHOOK = os.getenv(
 
 app = Flask(__name__)
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
-app.logger.setLevel(logging.getLogger().level)
+app.logger.setLevel(LOG_LEVEL)
+
+JOBS: Dict[str, Dict[str, Any]] = {}
+JLOCK = Lock()
+
+def _parse_int(s: Any, default: int) -> int:
+    try: return int(s)
+    except Exception: return default
+
+def _parse_float(s: Any, default: float) -> float:
+    try: return float(s)
+    except Exception: return default
 
 # -------------------- CORRECTION (impersonation) --------------------
 def _gdrive_service():
@@ -126,183 +138,87 @@ def _end(resp):
         pass
     return resp
 
-def _parse_int(s: Any, default: int) -> int:
-    try: return int(s)
-    except Exception: return default
-
-def _parse_float(s: Any, default: float) -> float:
-    try: return float(s)
-    except Exception: return default
-
-def _normalize_plan(raw: Any) -> List[Dict[str, Any]]:
+def _normalize_plan(plan_str: str) -> List[Dict[str, Any]]:
     """
+    Normalise l'entrée "plan" reçue depuis Make pour la passer à generate_video().
     Accepte:
       - un string JSON (objet avec {"plan":[...]} ou directement un array [...]),
       - un dict (avec clé "plan" ou directement la liste),
-      - une liste de segments.
-    BONUS compat:
-      - si "duration" est manquant mais qu'on a start_time/end_time -> on le calcule,
-      - si "gif_url" est manquant mais qu'on a url/video_url -> on mappe,
-      - si "subtitles" contient " | " (nouveau plan), on ne garde que le timestamp avant " | ".
-    L'API et le comportement restent identiques pour le reste du code.
-    """
-    # 1) Normaliser le type d'entrée
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode("utf-8", "ignore")
-
-    if isinstance(raw, str):
-        txt = raw.strip()
-        # Log debug optionnel
-        try:
-            if LOG_LEVEL == "DEBUG":
-                app.logger.info(f"[{getattr(g,'req_id','?')}] plan_len={len(txt)} head={txt[:400].replace(chr(10),' ')}")
-        except Exception:
-            pass
-
-        # Essai direct
-        try:
-            raw = json.loads(txt)
-        except json.JSONDecodeError:
-            # Tolérance: tenter d'extraire un objet { ... } ou un array [ ... ] imbriqué dans du bruit
+    Tolérance d'erreur:
+        # Tolérance: tenter d'extraire un objet { ... } ou un array [ ... ] imbriqué dans du bruit
             obj_s, arr_s = None, None
-            lcur, rcur = txt.find("{"), txt.rfind("}")
-            lbrk, rbrk = txt.find("["), txt.rfind("]")
-            if lcur != -1 and rcur != -1 and rcur > lcur:
-                candidate = txt[lcur:rcur+1]
-                try:
-                    obj_s = json.loads(candidate)
-                except Exception:
-                    obj_s = None
-            if obj_s is None and lbrk != -1 and rbrk != -1 and rbrk > lbrk:
-                candidate = txt[lbrk:rbrk+1]
-                try:
-                    arr_s = json.loads(candidate)
-                except Exception:
-                    arr_s = None
-            if obj_s is not None:
-                raw = obj_s
-            elif arr_s is not None:
-                raw = arr_s
-            else:
-                # dernier filet de sécurité: tronquer à la dernière '}'
-                last = txt.rfind("}")
-                if last != -1:
-                    raw = json.loads(txt[:last+1])
+    """
+    try:
+        if isinstance(plan_str, (dict, list)):
+            raw = plan_str
+        else:
+            try:
+                raw = json.loads(plan_str)
+            except Exception:
+                # Tolérance: tenter d'extraire un objet { ... } ou un array [ ... ] imbriqué dans du bruit
+                obj_s, arr_s = None, None
+                m = re.search(r"(\{.*\})", plan_str, re.DOTALL)
+                if m: obj_s = m.group(1)
+                m = re.search(r"(\[.*\])", plan_str, re.DOTALL)
+                if m: arr_s = m.group(1)
+                if obj_s:
+                    raw = json.loads(obj_s)
+                elif arr_s:
+                    raw = json.loads(arr_s)
                 else:
                     raise
 
-    # 2) Dégager la liste de segments
-    if isinstance(raw, dict) and "plan" in raw:
-        segments = raw["plan"]
-    elif isinstance(raw, list):
-        segments = raw
-    elif isinstance(raw, dict):
-        segments = [raw]
-    else:
-        raise ValueError("plan must be JSON (object with 'plan' or array of segments)")
-
-    if not isinstance(segments, list):
-        raise ValueError("plan must be a JSON array")
-    if not segments:
-        raise ValueError("plan is empty")
-
-    # 3) Normalisation douce (ancien + nouveau format)
-    out: List[Dict[str, Any]] = []
-    for i, seg in enumerate(segments):
-        if not isinstance(seg, dict):
-            continue
-        s = dict(seg)  # copie
-
-        # url fallback (gif_url prioritaire, sinon url/video_url/source_url)
-        if not s.get("gif_url"):
-            for alt in ("url", "video_url", "source_url"):
-                v = s.get(alt)
-                if isinstance(v, str) and v:
-                    s["gif_url"] = v
-                    break
-
-        # duration depuis end_time/start_time si absent/non valide
-        try:
-            d = float(s.get("duration")) if s.get("duration") is not None else None
-        except Exception:
-            d = None
-        if d is None or d <= 0:
-            st = s.get("start_time")
-            et = s.get("end_time")
-            try:
-                if st is not None and et is not None:
-                    s["duration"] = max(0.0, float(et) - float(st))
-            except Exception:
-                pass
-
-        # subtitles: ne garder que la partie "timestamp --> timestamp" si " | " présent
-        subs = s.get("subtitles")
-        if isinstance(subs, list):
-            clean = []
-            for line in subs:
-                if isinstance(line, str):
-                    clean.append(line.split(" | ", 1)[0].strip())
-            s["subtitles"] = clean
-
-        out.append(s)
-
-    if not out:
-        raise ValueError("plan is empty after normalization")
-
-    return out
-
-@app.get("/")
-def root():
-    return jsonify(ok=True, service="fusion-bot", ts=int(time.time()))
-
-# ---- Helpers callbacks/webhooks ---------------------------------------------
-
-def _post_callback(url: str, payload: Dict[str, Any]):
-    """Callback générique (progress, debug…)."""
-    try:
-        if _requests:
-            _requests.post(url, json=payload, timeout=10)
+        if isinstance(raw, dict) and "plan" in raw:
+            segments = raw["plan"]
+        elif isinstance(raw, list):
+            segments = raw
+        elif isinstance(raw, dict):
+            segments = [raw]
         else:
-            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
-                                         headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=10).read()
+            raise ValueError("plan must be JSON (object with 'plan' or array of segments)")
+
+        if not isinstance(segments, list):
+            raise ValueError("plan must be a JSON array")
+        if not segments:
+            raise ValueError("plan is empty")
+
+        out: List[Dict[str, Any]] = []
+        for i, seg in enumerate(segments):
+            if not isinstance(seg, dict):
+                continue
+            s = dict(seg)
+
+            if not s.get("gif_url"):
+                for alt in ("url", "video_url", "source_url"):
+                    v = s.get(alt)
+                    if isinstance(v, str) and v:
+                        s["gif_url"] = v
+                        break
+
+            if "duration" in s:
+                try: s["duration"] = float(s["duration"])
+                except Exception: s["duration"] = None
+
+            out.append(s)
+        return out
+    except Exception as e:
+        raise ValueError(f"invalid plan: {e}")
+
+def _post_finish_webhook(url: Optional[str], success: bool, output_name: str, compte: Optional[str], contenue: Optional[str]):
+    if not url or not _requests:
+        return
+    try:
+        payload = {
+            "success": success,
+            "output_name": output_name,
+            "compte": compte,
+            "Contenue": contenue,
+        }
+        _requests.post(url, json=payload, timeout=10)
     except Exception:
         pass
 
-def _post_finish_webhook(url: str, ok: bool, file_name: str, compte: Optional[str] = None, contenue: Optional[str] = None):
-    """
-    Webhook final : envoie { ok, file_name, compte } + éventuellement { Contenue }.
-    Déclenché EXCLUSIVEMENT quand l’upload Google Drive se termine.
-    """
-    payload = {"ok": bool(ok), "file_name": str(file_name), "compte": (compte or "")}
-    # ➕ nouvel item facultatif exactement nommé "Contenue"
-    if contenue is not None:
-        payload["Contenue"] = contenue
-
-    try:
-        if _requests:
-            _requests.post(url, json=payload, timeout=8)
-        else:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-            )
-            urllib.request.urlopen(req, timeout=8).read()
-    except Exception as e:
-        try:
-            app.logger.warning(f"[{getattr(g,'req_id','?')}] finish_webhook failed: {e}")
-        except Exception:
-            pass
-
 def _resolve_finish_webhook_from_request(req) -> Optional[str]:
-    """
-    Choisit l’URL de fin:
-      1) champ 'finish_webhook' (form ou query)
-      2) env FINISH_WEBHOOK
-      3) DEFAULT_FINISH_WEBHOOK
-    Valeurs vides/'none' désactivent l’appel.
-    """
     w = (
         (req.form.get("finish_webhook") if hasattr(req, "form") else None)
         or (req.args.get("finish_webhook") if hasattr(req, "args") else None)
@@ -326,6 +242,8 @@ def create_video():
         audio_file = request.files["audio_file"]
 
         style           = request.form.get("style", "default")
+        caption_style = request.form.get("caption_style")
+        srt_text      = request.form.get("srt_text")
         music_folder_id = request.form.get("music_folder_id")
         music_volume    = _parse_float(request.form.get("music_volume", 0.25), 0.25)
         drive_folder_id = request.form.get("drive_folder_id") or request.args.get("drive_folder_id")
@@ -345,17 +263,14 @@ def create_video():
         except Exception:
             total_dur = 0.0
         free_tmp = shutil.disk_usage("/tmp").free // (1024*1024)
-        app.logger.info(f"[{g.req_id}] preflight tmp: free={free_tmp}MB need≈~{int(total_dur*0.35)}MB")
+        app.logger.info(f"[{g.req_id}] preflight tmp: free={free_tmp} MiB, plan_items={len(plan)}, audio_name={getattr(audio_file,'filename',None)}")
 
-        workdir = tempfile.mkdtemp(prefix="fusionbot_")
+        workdir = tempfile.mkdtemp(prefix="create_sync_")
         debug_dir = os.path.join(workdir, "debug")
         os.makedirs(debug_dir, exist_ok=True)
 
         audio_path = os.path.join(workdir, "voice.mp3")
         audio_file.save(audio_path)
-        audio_size = os.path.getsize(audio_path)
-        audio_dur  = _ffprobe_duration(audio_path)
-        app.logger.info(f"[{g.req_id}] audio path={audio_path} size={audio_size}B dur={audio_dur:.3f}s")
 
         music_path, music_delay = (None, 0)
         if music_folder_id:
@@ -379,9 +294,31 @@ def create_video():
             music_volume=music_volume,
         )
 
+        # --- CAPTIONS: burn subtitles (optional) ---
+        try:
+            if caption_style and srt_text:
+                ass_path = os.path.join(workdir if "workdir" in locals() and workdir else os.path.dirname(out_path), "captions.ass")
+                ass_text = build_ass_from_srt(srt_text, preset=caption_style)
+                with open(ass_path, "w", encoding="utf-8") as f:
+                    f.write(ass_text)
+                fps_val = int(request.form.get("fps") or 30)
+                cmd = (
+                    f'ffmpeg -y -i "{out_path}" -vf "subtitles={ass_path}" '
+                    f'-c:v libx264 -preset veryfast -crf 22 -r {fps_val} -pix_fmt yuv420p '
+                    f'-c:a copy -movflags +faststart "{out_path[:-4]}_sub.mp4"'
+                )
+                subprocess.check_call(cmd, shell=True)
+                out_path = out_path[:-4] + "_sub.mp4"
+        except Exception as e:
+            app.logger.exception(f"[{g.req_id}] captions burn failed: {e}")
+        # --- END CAPTIONS ---
+
         out_size = os.path.getsize(out_path)
         out_dur  = _ffprobe_duration(out_path)
         app.logger.info(f"[{g.req_id}] OUTPUT path={out_path} size={out_size}B dur={out_dur:.3f}s")
+
+        with open(os.path.join(debug_dir, "generator_debug.json"), "w", encoding="utf-8") as f:
+            json.dump(gen_debug, f, ensure_ascii=False, indent=2)
 
         resp = {
             "status":"success","output_path":out_path,
@@ -414,14 +351,11 @@ def create_video():
         except Exception:
             pass
 
-# ---------------- ASYNC ----------------
-JOBS: Dict[str, Dict[str, Any]] = {}
-JLOCK = Lock()
-
 def _set_job(jid: str, **kw):
     with JLOCK:
         JOBS[jid] = {**JOBS.get(jid, {}), **kw}
 
+# ---------------- ASYNC ----------------
 def _worker_create_video(jid: str, fields: Dict[str, Any]):
     workdir = None
     req_id = fields.get("req_id", jid)
@@ -438,110 +372,121 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
         with app.app_context():
             g.req_id = req_id
 
-            output_name   = fields["output_name"]
-            width         = _parse_int(fields.get("width", 1080), 1080)
-            height        = _parse_int(fields.get("height", 1920), 1920)
-            fps           = _parse_int(fields.get("fps", 30), 30)
-            plan_str      = fields["plan"]
-            audio_srcpath = fields["audio_path"]
+        output_name    = fields["output_name"]
+        width          = _parse_int(fields.get("width") or 1080, 1080)
+        height         = _parse_int(fields.get("height") or 1920, 1920)
+        fps            = _parse_int(fields.get("fps") or 30, 30)
+        plan_str       = fields["plan"]
+        audio_path     = fields["audio_path"]
+        drive_folder_id= fields.get("drive_folder_id")
+        style          = fields.get("style", "default")
+        music_folder_id= fields.get("music_folder_id")
+        music_volume   = _parse_float(fields.get("music_volume") or 0.25, 0.25)
+        compte         = fields.get("compte")
+        contenue       = fields.get("Contenue")
 
-            style           = fields.get("style", "default")
-            drive_folder_id = fields.get("drive_folder_id")
-            music_folder_id = fields.get("music_folder_id")
-            music_volume    = _parse_float(fields.get("music_volume", 0.25), 0.25)
-            compte          = fields.get("compte")
-            contenue        = fields.get("Contenue")  # 🆕
+        plan = _normalize_plan(plan_str)
 
-            app.logger.info(f"[{req_id}] (async) start job {jid} name={output_name} "
-                            f"{width}x{height}@{fps} style={style}")
+        try:
+            total_dur = sum(float(max(0.0, (seg.get("duration") or 0))) for seg in plan)
+        except Exception:
+            total_dur = 0.0
 
-            plan = _normalize_plan(plan_str)
+        workdir = tempfile.mkdtemp(prefix=f"job_{jid}_")
+        debug_dir = os.path.join(workdir, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
 
+        with open(os.path.join(debug_dir, "plan_input.json"), "w", encoding="utf-8") as f:
+            json.dump({"plan": plan}, f, ensure_ascii=False, indent=2)
+
+        music_path, music_delay = (None, 0)
+        if music_folder_id:
+            music_path, music_delay = _gdrive_pick_and_download_music(music_folder_id, workdir, app.logger, req_id)
+            if music_path:
+                app.logger.info(f"[{req_id}] musique DL ok -> {music_path} delay={music_delay}s vol={music_volume}")
+
+        with open(os.path.join(debug_dir, "job_fields.json"), "w", encoding="utf-8") as f:
+            json.dump({k: v for k, v in fields.items() if k not in ("audio_path",)}, f, ensure_ascii=False, indent=2)
+
+        _set_job(jid, status="running", stage="encoding", updated_at=int(time.time()))
+
+        out_path, gen_debug = generate_video(
+            plan=plan,
+            audio_path=audio_path,
+            output_name=output_name,
+            temp_dir=workdir,
+            width=width, height=height, fps=fps,
+            logger=app.logger, req_id=req_id,
+            style=style,
+            music_path=music_path,
+            music_delay=music_delay,
+            music_volume=music_volume,
+        )
+
+        # --- CAPTIONS: burn subtitles (optional) ---
+        try:
+            caption_style = fields.get("caption_style")
+            srt_text = fields.get("srt_text")
+            if caption_style and srt_text:
+                ass_path = os.path.join(workdir if workdir else os.path.dirname(out_path), "captions.ass")
+                ass_text = build_ass_from_srt(srt_text, preset=caption_style)
+                with open(ass_path, "w", encoding="utf-8") as f:
+                    f.write(ass_text)
+                fps_val = int(fields.get("fps") or 30)
+                cmd = (
+                    f'ffmpeg -y -i "{out_path}" -vf "subtitles={ass_path}" '
+                    f'-c:v libx264 -preset veryfast -crf 22 -r {fps_val} -pix_fmt yuv420p '
+                    f'-c:a copy -movflags +faststart "{out_path[:-4]}_sub.mp4"'
+                )
+                subprocess.check_call(cmd, shell=True)
+                out_path = out_path[:-4] + "_sub.mp4"
+        except Exception as e:
+            app.logger.exception(f"[{req_id}] captions burn failed: {e}")
+        # --- END CAPTIONS ---
+
+        out_size = os.path.getsize(out_path)
+        out_dur  = _ffprobe_duration(out_path)
+        app.logger.info(f"[{req_id}] (async) OUTPUT path={out_path} size={out_size}B dur={out_dur:.3f}s")
+
+        with open(os.path.join(debug_dir, "generator_debug.json"), "w", encoding="utf-8") as f:
+            json.dump(gen_debug, f, ensure_ascii=False, indent=2)
+
+        result = {
+            "status": "success",
+            "job_id": jid,
+            "output_path": out_path,
+            "width": width, "height": height, "fps": fps,
+            "items": len(plan),
+            "out_size": out_size, "out_duration": out_dur,
+            "workdir": workdir,
+            "req_id": req_id,
+        }
+
+        if drive_folder_id:
             try:
-                total_dur = sum(float(max(0.0, (seg.get("duration") or 0))) for seg in plan)
+                gd = _gdrive_upload(out_path, output_name, drive_folder_id, app.logger, req_id)
+                result.update({
+                    "drive_file_id": gd.get("id"),
+                    "drive_webViewLink": gd.get("webViewLink"),
+                })
+                if finish_webhook:
+                    _post_finish_webhook(finish_webhook, True, output_name, compte, contenue)
+            except Exception as e:
+                app.logger.exception(f"[{req_id}] drive upload failed: {e}")
+                result["drive_error"] = str(e)
+                if finish_webhook:
+                    _post_finish_webhook(finish_webhook, False, output_name, compte, contenue)
+
+        _set_job(jid, **result)
+        if callback_url:
+            try:
+                _requests.post(callback_url, json=result, timeout=10)
             except Exception:
-                total_dur = 0.0
-            free_tmp = shutil.disk_usage("/tmp").free // (1024*1024)
-            app.logger.info(f"[{req_id}] preflight tmp: free={free_tmp}MB need≈~{int(total_dur*0.35)}MB")
-
-            workdir = tempfile.mkdtemp(prefix=f"fusionjob_{jid}_")
-            debug_dir = os.path.join(workdir, "debug")
-            os.makedirs(debug_dir, exist_ok=True)
-
-            audio_path = os.path.join(workdir, "voice.mp3")
-            shutil.copy2(audio_srcpath, audio_path)
-            audio_size = os.path.getsize(audio_path)
-            audio_dur  = _ffprobe_duration(audio_path)
-            app.logger.info(f"[{req_id}] audio path={audio_path} size={audio_size}B dur={audio_dur:.3f}s")
-
-            music_path, music_delay = (None, 0)
-            if music_folder_id:
-                music_path, music_delay = _gdrive_pick_and_download_music(music_folder_id, workdir, app.logger, req_id)
-                if music_path:
-                    app.logger.info(f"[{req_id}] musique DL ok -> {music_path} delay={music_delay}s vol={music_volume}")
-
-            with open(os.path.join(debug_dir, "plan_input.json"), "w", encoding="utf-8") as f:
-                json.dump({"plan": plan}, f, ensure_ascii=False, indent=2)
-
-            _set_job(jid, status="running", stage="encoding", updated_at=int(time.time()))
-
-            out_path, gen_debug = generate_video(
-                plan=plan,
-                audio_path=audio_path,
-                output_name=output_name,
-                temp_dir=workdir,
-                width=width, height=height, fps=fps,
-                logger=app.logger, req_id=req_id,
-                style=style,
-                music_path=music_path,
-                music_delay=music_delay,
-                music_volume=music_volume,
-            )
-
-            out_size = os.path.getsize(out_path)
-            out_dur  = _ffprobe_duration(out_path)
-            app.logger.info(f"[{req_id}] (async) OUTPUT path={out_path} size={out_size}B dur={out_dur:.3f}s")
-
-            with open(os.path.join(debug_dir, "generator_debug.json"), "w", encoding="utf-8") as f:
-                json.dump(gen_debug, f, ensure_ascii=False, indent=2)
-
-            result = {
-                "status": "success",
-                "job_id": jid,
-                "output_path": out_path,
-                "width": width, "height": height, "fps": fps,
-                "items": len(plan),
-                "out_size": out_size, "out_duration": out_dur,
-                "workdir": workdir,
-                "req_id": req_id,
-            }
-
-            if drive_folder_id:
-                try:
-                    gd = _gdrive_upload(out_path, output_name, drive_folder_id, app.logger, req_id)
-                    result.update({
-                        "drive_file_id": gd.get("id"),
-                        "drive_webViewLink": gd.get("webViewLink"),
-                    })
-                    if finish_webhook:
-                        _post_finish_webhook(finish_webhook, True, output_name, compte, contenue)
-                except Exception as e:
-                    app.logger.exception(f"[{req_id}] drive upload failed: {e}")
-                    result["drive_error"] = str(e)
-                    if finish_webhook:
-                        _post_finish_webhook(finish_webhook, False, output_name, compte, contenue)
-
-            _set_job(jid, **result)
-            if callback_url:
-                _post_callback(callback_url, {"job_id": jid, **result})
+                pass
 
     except Exception as e:
-        err = {"status": "error", "job_id": jid, "message": str(e), "req_id": req_id}
-        _set_job(jid, **err)
-        app.logger.error(f"[{req_id}] job error: {e}\n{traceback.format_exc()}")
-        if callback_url:
-            try: _post_callback(callback_url, {"job_id": jid, **err})
-            except Exception: pass
+        app.logger.error(f"[{req_id}] worker failed: {e}\n{traceback.format_exc()}")
+        _set_job(jid, status="failed", error=str(e), req_id=req_id)
     finally:
         try:
             if not KEEP_TMP and os.getenv("CLEAN_TMP") == "1" and workdir and os.path.isdir(workdir):
@@ -549,6 +494,7 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
         except Exception:
             pass
 
+# ---------------- QUEUE API ----------------
 @app.post("/create-video-async")
 def create_video_async():
     jid = request.form.get("job_id") or str(uuid4())
@@ -577,6 +523,9 @@ def create_video_async():
             "compte": request.form.get("compte") or request.args.get("compte"),
             # 🆕 on transporte tel-quel la narration "Contenue" pour l’async
             "Contenue": request.form.get("Contenue") or request.args.get("Contenue"),
+            # 🆕 CAPTIONS
+            "caption_style": request.form.get("caption_style"),
+            "srt_text": request.form.get("srt_text"),
         }
 
         _set_job(jid, status="queued", job_id=jid, req_id=req_id, enqueued_at=int(time.time()))
