@@ -1,19 +1,20 @@
-# captions.py — "one-word" captions centered, big, yellow with black outline
+# captions.py — One word at a time, HUGE, dead-center, yellow with black outline.
+
 from dataclasses import dataclass
 import html, json, ast, re
 
 @dataclass
 class CapStyle:
     name: str = "default"
-    font: str = "DejaVu Sans Bold"   # gras par défaut
-    size: int = 140                  # taille bien grande pour 1080x1920
-    outline: int = 8                 # gros contour
-    shadow: int = 3
-    align: int = 5                   # 5 = milieu centre
-    margin_v: int = 0                # pas de marge verticale (plein centre)
-    primary: str = "&H0000FFFF&"     # JAUNE (B,G,R,00) -> &H00BBGGRR&
-    back:    str = "&H00000000&"     # contour noir (via OutlineColour)
+    font: str = "DejaVu Sans Bold"
+    size: int = 220              # très grand pour 1080x1920
+    outline: int = 10            # contour épais
+    shadow: int = 0              # pas d'ombre
+    align: int = 5               # centre (ASS)
+    margin_v: int = 0
+    primary: str = "&H0000FFFF&"         # jaune  (AA BB GG RR -> 00 00 FF FF)
     outline_colour: str = "&H00000000&"  # noir
+    back: str = "&H00000000&"            # non utilisé (BorderStyle 1)
 
 STYLE = CapStyle()
 
@@ -42,17 +43,12 @@ def _escape(text: str) -> str:
     text = html.unescape(text or "")
     return text.replace("{", r"\{").replace("}", r"\}")
 
-# --- Input parsing ---------------------------------------------------
+# --- Parse srt_text venant de Make (array words[] OU JSON complet) ---
 def _parse_words_payload(payload: str):
-    """
-    Accepte:
-      - l'ARRAY 'words' sérialisé (JSON ou repr Python)
-      - ou le JSON complet { task, language, duration, text, words: [...] }
-    """
     if not payload: return []
-    txt = payload.strip()
+    txt = (payload or "").strip()
 
-    # 1) JSON strict
+    # JSON strict
     try:
         obj = json.loads(txt)
         if isinstance(obj, dict) and isinstance(obj.get("words"), list):
@@ -62,7 +58,7 @@ def _parse_words_payload(payload: str):
     except Exception:
         pass
 
-    # 2) literal_eval (repr Python Make)
+    # literal_eval (repr Python)
     try:
         obj = ast.literal_eval(txt)
         if isinstance(obj, dict) and isinstance(obj.get("words"), list):
@@ -72,9 +68,8 @@ def _parse_words_payload(payload: str):
     except Exception:
         pass
 
-    # 3) extraction tolérante
+    # extraction tolérante du bloc "words":[...]
     try:
-        # cherche le bloc "words":[ ... ]
         m = re.search(r'"?words"?\s*:\s*(\[[\s\S]*?\])', txt, flags=re.I)
         if m:
             arr = json.loads(m.group(1))
@@ -83,7 +78,7 @@ def _parse_words_payload(payload: str):
     except Exception:
         pass
 
-    # 4) fallback ultra-léger: triplets (word,start,end)
+    # fallback: triplets word/start/end
     pairs = re.findall(
         r"word['\"]?\s*:\s*['\"]([^'^\"]+)['\"].*?start['\"]?\s*:\s*([0-9.]+).*?end['\"]?\s*:\s*([0-9.]+)",
         txt, flags=re.I|re.S
@@ -108,27 +103,28 @@ def _clean(arr):
 
 def build_ass_from_srt(srt_text: str, preset: str = "default") -> str:
     """
-    Utilisée par main.py.
-    Ici srt_text contient soit la liste words[], soit le JSON complet (on isole words[]).
-    On rend UN mot à la fois, au centre, taille XL, jaune avec contour noir.
+    Utilisé par main.py. Rend **un seul mot** au centre, énorme.
+    srt_text = array words[] ou JSON complet contenant 'words'.
     """
     words = _parse_words_payload(srt_text or "")
     if not words:
-        return ASS_HEADER  # rien à afficher
+        return ASS_HEADER
 
     lines = []
     n = len(words)
     for i, w in enumerate(words):
         st = w["start"]
-        # couper juste avant le mot suivant pour éviter les superpositions
+        en = w["end"]
         if i < n - 1:
-            en = min(w["end"], words[i+1]["start"] - 0.01)
+            en = min(en, words[i+1]["start"] - 0.01)
             if en <= st: en = st + 0.03
-        else:
-            en = w["end"]
 
         text = _escape(w["word"])
-        # \an5 est déjà dans le style; on garde le mot seul, en gras via le style.
-        lines.append(f"Dialogue: 0,{_ass_time(st)},{_ass_time(en)},{STYLE.name},{text}")
+
+        # On force position et style au runtime pour être SÛR du centre et de la taille
+        # \pos(540,960) = centre exact pour 1080x1920
+        # \fs = taille police, \bord = contour, \shad = ombre (0)
+        override = f"{{\\an5\\pos(540,960)\\fs{STYLE.size}\\bord{STYLE.outline}\\shad{STYLE.shadow}}}"
+        lines.append(f"Dialogue: 0,{_ass_time(st)},{_ass_time(en)},{STYLE.name},{override}{text}")
 
     return ASS_HEADER + "\n".join(lines)
