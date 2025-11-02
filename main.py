@@ -210,7 +210,7 @@ def _post_finish_webhook(url: Optional[str], success: bool, output_name: str, co
     try:
         payload = {
             "success": success,
-            "output_name": output_name,
+            "file_name": output_name,
             "compte": compte,
             "Contenue": contenue,
         }
