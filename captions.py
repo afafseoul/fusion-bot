@@ -1,6 +1,4 @@
-# captions.py — INPUT: srt_text = full JSON from Make (task, text, words[])
-# Extract only "words" array and generate ASS subtitles
-
+# captions.py — build-up par groupes de 5 mots, centré au milieu, texte large.
 from dataclasses import dataclass
 import html, json, ast, re
 
@@ -8,13 +6,13 @@ import html, json, ast, re
 class CapStyle:
     name: str = "default"
     font: str = "DejaVu Sans"
-    size: int = 64
-    outline: int = 4
+    size: int = 96           # plus gros
+    outline: int = 6         # contour plus épais
     shadow: int = 2
-    align: int = 2           # 2 = bottom center
-    margin_v: int = 120
-    primary: str = "&H00FFFFFF&"   # white
-    active:  str = "&H0000FFFF&"   # yellow
+    align: int = 5           # 5 = milieu centre
+    margin_v: int = 40
+    primary: str = "&H00FFFFFF&"   # blanc
+    active:  str = "&H0000FFFF&"   # jaune
     back:    str = "&H80000000&"
 
 STYLE = CapStyle()
@@ -44,42 +42,9 @@ def _escape(text: str) -> str:
     text = html.unescape(text or "")
     return text.replace("{", r"\{").replace("}", r"\}")
 
-def _parse_words(payload: str):
-    """Accept raw words[] OR full Whisper JSON with 'words' key."""
-    if not payload:
-        return []
-    txt = payload.strip()
-
-    # JSON input
-    try:
-        obj = json.loads(txt)
-        if isinstance(obj, list):
-            return _clean(obj)
-        if isinstance(obj, dict) and isinstance(obj.get("words"), list):
-            return _clean(obj["words"])
-    except:
-        pass
-
-    # Python repr input
-    try:
-        obj = ast.literal_eval(txt)
-        if isinstance(obj, list):
-            return _clean(obj)
-        if isinstance(obj, dict) and isinstance(obj.get("words"), list):
-            return _clean(obj["words"])
-    except:
-        pass
-
-    # Regex fallback
-    pairs = re.findall(
-        r"word['\"]?\s*:\s*['\"]([^'^\"]+)['\"].*?start['\"]?\s*:\s*([0-9.]+).*?end['\"]?\s*:\s*([0-9.]+)",
-        txt, flags=re.I|re.S
-    )
-    return _clean([{"word": w, "start": float(s), "end": float(e)} for (w,s,e) in pairs])
-
 def _clean(arr):
     out = []
-    for w in arr:
+    for w in arr or []:
         try:
             word = str(w.get("word","")).strip()
             st   = float(w.get("start", 0.0))
@@ -87,25 +52,84 @@ def _clean(arr):
             if not word: continue
             if en <= st: en = st + 0.05
             out.append({"word": word, "start": st, "end": en})
-        except:
+        except Exception:
             continue
     out.sort(key=lambda x: (x["start"], x["end"]))
     return out
 
-def _window_line(words, i, window=5):
-    a = max(0, i - (window - 1))
-    chunk = []
-    for j, w in enumerate(words[a:i+1]):
+def _parse_payload(payload: str):
+    """
+    Accepte :
+      - JSON complet { task, language, text, words:[...] }
+      - juste words[] (JSON)
+      - repr Python (Make) de words[]
+      - tolérance via regex
+    Retourne: liste propre de dicts {word,start,end}
+    """
+    if not payload: return []
+    txt = str(payload).strip()
+
+    # 1) JSON strict
+    try:
+        obj = json.loads(txt)
+        if isinstance(obj, dict) and "words" in obj:
+            return _clean(obj.get("words"))
+        if isinstance(obj, list):
+            return _clean(obj)
+    except Exception:
+        pass
+
+    # 2) literal_eval pour repr Python
+    try:
+        obj = ast.literal_eval(txt)
+        if isinstance(obj, dict) and "words" in obj:
+            return _clean(obj.get("words"))
+        if isinstance(obj, list):
+            return _clean(obj)
+    except Exception:
+        pass
+
+    # 3) Regex tolérante
+    pairs = re.findall(
+        r"word['\"]?\s*:\s*['\"]([^'^\"]+)['\"].*?start['\"]?\s*:\s*([0-9.]+).*?end['\"]?\s*:\s*([0-9.]+)",
+        txt, flags=re.I|re.S
+    )
+    return _clean([{"word":w, "start":float(s), "end":float(e)} for (w,s,e) in pairs])
+
+def _build_up_line(words, i, group_size=5):
+    """
+    Build-up dans un groupe de `group_size` mots.
+    i = index global du mot courant.
+    Exemple group_size=5:
+      0: [w0]
+      1: [w0 w1]
+      2: [w0 w1 w2]
+      3: [w0 w1 w2 w3]
+      4: [w0 w1 w2 w3 w4]  -> reset au mot suivant
+      5: [w5]
+      ...
+    Le mot courant est surligné.
+    """
+    g_idx   = i % group_size
+    g_start = i - g_idx
+    span    = words[g_start:i+1]
+
+    parts = []
+    for k, w in enumerate(span):
         tok = _escape(w["word"])
-        if j == len(words[a:i+1]) - 1:  # highlighted current word
-            chunk.append(f"{{\\c{STYLE.active}\\b1}}{tok}{{\\c{STYLE.primary}\\b0}}")
+        if k == len(span) - 1:
+            parts.append(f"{{\\c{STYLE.active}\\b1}}{tok}{{\\c{STYLE.primary}\\b0}}")
         else:
-            chunk.append(tok)
-    return " ".join(chunk)
+            parts.append(tok)
+    return " ".join(parts)
 
 def build_ass_from_srt(srt_text: str, preset: str = "default") -> str:
-    """Interpret srt_text as Whisper words JSON (not SRT)."""
-    words = _parse_words(srt_text or "")
+    """
+    Même signature que l'ancien code. Ici srt_text peut contenir:
+      - JSON complet avec 'words'
+      - ou juste l'array words[].
+    """
+    words = _parse_payload(srt_text or "")
     if not words:
         return ASS_HEADER
 
@@ -113,13 +137,15 @@ def build_ass_from_srt(srt_text: str, preset: str = "default") -> str:
     n = len(words)
     for i, w in enumerate(words):
         st = w["start"]
+        # borne l'affichage jusqu'au début du mot suivant, pour éviter l'empilement
         if i < n - 1:
             en = min(w["end"], words[i+1]["start"] - 0.01)
             if en <= st: en = st + 0.03
         else:
             en = w["end"]
 
-        text = _window_line(words, i, window=5)
+        text = _build_up_line(words, i, group_size=5)
+        # l'alignement principal est dans le style ; on laisse l'override par sécurité
         lines.append(f"Dialogue: 0,{_ass_time(st)},{_ass_time(en)},{STYLE.name},{{\\an{STYLE.align}}}{text}")
 
     return ASS_HEADER + "\n".join(lines)
