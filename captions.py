@@ -1,118 +1,110 @@
-# captions.py — INPUT: srt_text = array "brut" words[] (Make)
-# words[] = [{ "word": "as", "start": 3.12, "end": 3.40 }, ...]
-from dataclasses import dataclass
-import html, json, ast, re
+def _parse_words(payload):
+    """
+    Accepte :
+      - string JSON (liste de mots OU objet { words: [...] } OU { data: { words: [...] } })
+      - repr Python (Make) équivalents
+      - dict/list déjà parsés
+      - SRT (fallback : conversion approximative mot-à-mot)
+    """
+    import json, ast, re
 
-@dataclass
-class CapStyle:
-    name: str = "default"
-    font: str = "DejaVu Sans"
-    size: int = 64
-    outline: int = 4
-    shadow: int = 2
-    align: int = 2           # 2 = bas centre
-    margin_v: int = 120
-    primary: str = "&H00FFFFFF&"   # blanc
-    active:  str = "&H0000FFFF&"   # jaune
-    back:    str = "&H80000000&"
+    def _clean(arr):
+        out = []
+        for w in arr or []:
+            try:
+                word = str(w.get("word","")).strip()
+                st   = float(w.get("start", 0.0))
+                en   = float(w.get("end",   st + 0.05))
+                # tolère les timestamps en millisecondes
+                if st > 1000 or en > 1000:
+                    st, en = st / 1000.0, en / 1000.0
+                if not word:
+                    continue
+                if en <= st:
+                    en = st + 0.05
+                out.append({"word": word, "start": st, "end": en})
+            except Exception:
+                continue
+        out.sort(key=lambda x: (x["start"], x["end"]))
+        return out
 
-STYLE = CapStyle()
+    def _from_obj(obj):
+        # list directe
+        if isinstance(obj, list):
+            return _clean(obj)
+        # dict avec words au top-level
+        if isinstance(obj, dict):
+            if "words" in obj and isinstance(obj["words"], list):
+                return _clean(obj["words"])
+            # dict avec data.words (cas OpenAI HTTP data complet)
+            data = obj.get("data")
+            if isinstance(data, dict) and isinstance(data.get("words"), list):
+                return _clean(data["words"])
+        return []
 
-ASS_HEADER = f"""[Script Info]
-ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
+    # 1) déjà parsé ?
+    if isinstance(payload, (list, dict)):
+        words = _from_obj(payload)
+        if words: return words
 
-[V4+ Styles]
-Format: Name,Fontname,Fontsize,PrimaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-Style: {STYLE.name},{STYLE.font},{STYLE.size},{STYLE.primary},&H00000000,{STYLE.back},-1,0,0,0,100,100,0,0,1,{STYLE.outline},{STYLE.shadow},{STYLE.align},60,60,{STYLE.margin_v},1
+    # 2) string → JSON ou repr python
+    if isinstance(payload, str):
+        txt = payload.strip()
 
-[Events]
-Format: Layer, Start, End, Style, Text
-"""
+        # JSON strict
+        if txt.startswith("{") or txt.startswith("["):
+            try:
+                obj = json.loads(txt)
+                words = _from_obj(obj)
+                if words: return words
+            except Exception:
+                pass
 
-def _ass_time(t: float) -> str:
-    if t < 0: t = 0.0
-    h = int(t // 3600); t -= 3600*h
-    m = int(t // 60);   t -= 60*m
-    s = int(t)
-    cs = int(round((t - s) * 100))
-    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
-
-def _escape(text: str) -> str:
-    text = html.unescape(text or "")
-    return text.replace("{", r"\{").replace("}", r"\}")
-
-def _parse_words(payload: str):
-    """payload = string de l'array words[] venu de Make (JSON ou repr Python)."""
-    if not payload: return []
-    txt = payload.strip()
-    # 1) JSON strict
-    try:
-        obj = json.loads(txt)
-        if isinstance(obj, list): return _clean(obj)
-    except Exception:
-        pass
-    # 2) literal_eval (repr Python typique de Make)
-    try:
-        obj = ast.literal_eval(txt)
-        if isinstance(obj, list): return _clean(obj)
-    except Exception:
-        pass
-    # 3) Tolérance minimale (sécurité)
-    pairs = re.findall(r"word['\"]?\s*:\s*['\"]([^'^\"]+)['\"].*?start['\"]?\s*:\s*([0-9.]+).*?end['\"]?\s*:\s*([0-9.]+)",
-                       txt, flags=re.I|re.S)
-    return _clean([{"word":w, "start":float(s), "end":float(e)} for (w,s,e) in pairs])
-
-def _clean(arr):
-    out = []
-    for w in arr:
+        # repr Python (Make)
         try:
-            word = str(w.get("word","")).strip()
-            st   = float(w.get("start", 0.0))
-            en   = float(w.get("end",   st + 0.05))
-            if not word: continue
-            if en <= st: en = st + 0.05
-            out.append({"word": word, "start": st, "end": en})
+            obj = ast.literal_eval(txt)
+            words = _from_obj(obj)
+            if words: return words
         except Exception:
-            continue
-    # tri défensif
-    out.sort(key=lambda x: (x["start"], x["end"]))
-    return out
+            pass
 
-def _window_line(words, i, window=5):
-    a = max(0, i - (window - 1))
-    chunk = []
-    for j, w in enumerate(words[a:i+1]):
-        tok = _escape(w["word"])
-        if j == len(words[a:i+1]) - 1:    # mot courant
-            chunk.append(f"{{\\c{STYLE.active}\\b1}}{tok}{{\\c{STYLE.primary}\\b0}}")
-        else:
-            chunk.append(tok)
-    return " ".join(chunk)
+        # 3) SRT fallback (si jamais on reçoit un vrai SRT)
+        if "-->" in txt:
+            # conversion bloc→mots approximative
+            def _sec(t):
+                h,m,s = t.split(":")
+                if "," in s:
+                    s,ms = s.split(",")
+                    return int(h)*3600+int(m)*60+int(s)+int(ms)/1000.0
+                return int(h)*3600+int(m)*60+float(s)
+            out = []
+            for block in txt.replace("\r","").split("\n\n"):
+                lines = [l for l in block.split("\n") if l.strip()]
+                if len(lines) < 2: 
+                    continue
+                tline = next((l for l in lines if "-->" in l), None)
+                if not tline:
+                    continue
+                ts, te = [p.strip() for p in tline.split("-->")]
+                start, end = _sec(ts), _sec(te)
+                text = " ".join(l for l in lines if "-->" not in l and not l.isdigit())
+                toks = [t for t in text.split() if t]
+                if not toks:
+                    continue
+                dur = max(1e-3, end-start); step = dur/len(toks)
+                for i,t in enumerate(toks):
+                    s = start + i*step
+                    e = min(end, s+step)
+                    out.append({"word": t, "start": s, "end": e})
+            return out
 
-def build_ass_from_srt(srt_text: str, preset: str = "default") -> str:
-    """
-    Signature conservée pour main.py.
-    Interprète srt_text comme ARRAY words[] (pas de SRT).
-    """
-    words = _parse_words(srt_text or "")
-    if not words:
-        return ASS_HEADER  # pas de sous-titres si vide
+        # 4) Regex tolérante (secours)
+        pairs = re.findall(
+            r"word['\"]?\s*:\s*['\"]([^'^\"]+)['\"].*?start['\"]?\s*:\s*([0-9.]+).*?end['\"]?\s*:\s*([0-9.]+)",
+            txt, flags=re.I|re.S
+        )
+        if pairs:
+            return _clean([{"word":w, "start":float(s), "end":float(e)} for (w,s,e) in pairs])
 
-    # crée une ligne par mot, sans chevauchement visuel
-    lines = []
-    n = len(words)
-    for i, w in enumerate(words):
-        st = w["start"]
-        # borne l'affichage à juste avant le mot suivant (évite les empilements)
-        if i < n - 1:
-            en = min(w["end"], words[i+1]["start"] - 0.01)
-            if en <= st: en = st + 0.03
-        else:
-            en = w["end"]
-
-        text = _window_line(words, i, window=5)
-        lines.append(f"Dialogue: 0,{_ass_time(st)},{_ass_time(en)},{STYLE.name},{{\\an{STYLE.align}}}{text}")
-
-    return ASS_HEADER + "\n".join(lines)
+    # rien de valable
+    return []
