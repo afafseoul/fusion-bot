@@ -1,24 +1,19 @@
-# captions.py — SRT -> ASS avec "pop" mot-par-mot façon CapCut (sans SRT mots)
-# - La phrase entière reste visible (blanc + contour noir)
-# - Chaque mot apparaît en surbrillance (jaune) avec un effet d'agrandissement (pop)
-# - Timing: durée de la phrase répartie uniformément entre les mots
-
+# captions.py — SRT classique OU JSON { "words": [...] } -> ASS
 from dataclasses import dataclass
-import re, html
+import re, html, json
 
 @dataclass
 class CapStyle:
     name: str
     font: str = "DejaVu Sans"
-    size: int = 92            # gros
-    outline: int = 7          # contour épais (pseudo-box)
-    shadow: int = 0
-    align: int = 5            # 5 = centre (milieu)
+    size: int = 72           # plus gros
+    outline: int = 4
+    shadow: int = 2
+    align: int = 5           # centre absolu
     margin_v: int = 0
-    primary: str = "&H00FFFFFF&"   # BLANC (phrase de base)
-    active_fill: str = "&H0000FFFF&"  # JAUNE (mot actif)
-    outline_col: str = "&H00101010&"  # contour sombre
-    back:    str = "&H00000000&"      # inutilisé (pas de box opaque)
+    primary: str = "&H00FFFFFF&"   # blanc (autres mots)
+    active:  str = "&H0033CCFF&"   # jaune/orangé (mot courant)
+    back:    str = "&H80000000&"   # fond (bordures)
 
 PRESETS = {
     "default": CapStyle(name="default"),
@@ -30,15 +25,15 @@ PlayResX: 1080
 PlayResY: 1920
 
 [V4+ Styles]
-; Primary = blanc, Outline = sombre. Secondary n'est pas utilisé ici.
-Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-Style: {name},{font},{size},{primary},&H00FFFFFF&,{outline_col},{back},-1,0,0,0,100,100,0,0,1,{outline},{shadow},{align},60,60,{margin_v},1
+Format: Name,Fontname,Fontsize,PrimaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: {name},{font},{size},{primary},&H00000000,{back},-1,0,0,0,100,100,0,0,1,{outline},{shadow},{align},60,60,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Text
 """
 
 def _ass_time(t: float) -> str:
+    t = max(0.0, float(t))
     h = int(t // 3600); t -= 3600*h
     m = int(t // 60);   t -= 60*m
     s = int(t)
@@ -48,101 +43,98 @@ def _ass_time(t: float) -> str:
 def _srt_blocks(srt_text: str):
     return re.split(r"\n\s*\n", srt_text.strip(), flags=re.MULTILINE)
 
-def _parse_times(block: str):
-    m = re.search(
-        r"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})",
-        block
-    )
-    if not m:
-        return None, None
-    hh1,mm1,ss1,ms1, hh2,mm2,ss2,ms2 = m.groups()
-    start = int(hh1)*3600 + int(mm1)*60 + int(ss1) + int(ms1)/1000.0
-    end   = int(hh2)*3600 + int(mm2)*60 + int(ss2) + int(ms2)/1000.0
-    return start, end
+def _escape_ass(s: str) -> str:
+    s = html.unescape(str(s))
+    return s.replace("{", r"\{").replace("}", r"\}")
 
-def _clean_text_lines(block: str):
-    lines = block.strip().splitlines()
-    if lines and lines[0].strip().isdigit():
-        lines = lines[1:]
-    if lines and re.search(r"-->", lines[0]):
-        lines = lines[1:]
-    text = " ".join(lines).strip()
-    text = html.unescape(text).replace("{", r"\{").replace("}", r"\}")
-    return text
+# ---------- Mode SRT classique ----------
+def srt_to_ass_lines(srt_text: str, style: CapStyle) -> str:
+    out = []
+    for b in _srt_blocks(srt_text):
+        m = re.search(r"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})", b)
+        if not m:
+            continue
+        hh1,mm1,ss1,ms1, hh2,mm2,ss2,ms2 = m.groups()
+        start = int(hh1)*3600+int(mm1)*60+int(ss1)+int(ms1)/1000.0
+        end   = int(hh2)*3600+int(mm2)*60+int(ss2)+int(ms2)/1000.0
 
-# --------- Génération des lignes ---------
+        lines = [ln for ln in b.strip().splitlines() if ln.strip()]
+        # drop index + time line
+        if lines and lines[0].strip().isdigit(): lines = lines[1:]
+        if lines and "-->" in lines[0]: lines = lines[1:]
+        if not lines: continue
 
-def _base_sentence_line(text: str, start: float, end: float, st: CapStyle) -> str:
-    # Phrase entière en blanc, contour noir — toujours visible
-    return (
-        f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},{st.name},"
-        f"{{\\an{st.align}\\1c{st.primary}\\3c{st.outline_col}\\bord{st.outline}\\fs{st.size}}}{text}"
-    )
+        text = _escape_ass(" ".join(lines))
+        out.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},{style.name},{{\\an{style.align}}}{text}")
+    return "\n".join(out)
 
-def _overlay_word_line(words, i, start, end, st: CapStyle) -> str:
-    """
-    Crée une ligne overlay qui affiche SEULEMENT le mot i :
-      - les autres mots sont masqués via alpha.
-      - le mot i est jaune + 'pop' (zoom in/out) avec \\t.
-    """
-    n = max(1, len(words))
-    dur = max(0.05, end - start)
-    w_start = start + (i * dur) / n
-    w_end   = start + ((i + 1) * dur) / n
+# ---------- Mode JSON "words" (fenêtre glissante + highlight) ----------
+def words_json_to_ass(words_json: str, style: CapStyle, window_size: int = 5) -> str:
+    try:
+        data = json.loads(words_json)
+        words = data["words"]
+    except Exception:
+        # Pas JSON valide -> on retombe en SRT normal
+        return srt_to_ass_lines(words_json, style)
 
-    # timing d'animation en ms (court "pop")
-    total_ms = int((w_end - w_start) * 1000)
-    in_ms = min(120, total_ms // 3)
-    out_ms = min(120, total_ms // 3)
-    steady_ms = max(0, total_ms - in_ms - out_ms)
+    out_lines = []
+    n = len(words)
+    # normaliser
+    seq = []
+    for w in words:
+        try:
+            word = str(w.get("word","")).strip()
+            if not word: continue
+            start = float(w.get("start"))
+            end   = float(w.get("end"))
+            if end <= start: end = start + 0.05
+            seq.append((word, start, end))
+        except Exception:
+            continue
 
-    # construction du texte : mots non-actifs alpha 100%, mot actif alpha 0 + couleur + pop
-    parts = []
-    for j, w in enumerate(words):
-        if j == i:
-            # mot visible + surligné, zoom (115%) au début puis retour à 100%
-            parts.append(
-                "{\\alpha&H00&\\1c" + st.active_fill +
-                f"\\3c{st.outline_col}\\bord{max(2, st.outline)}"
-                "\\t(0," + str(in_ms) + ",\\fscx115\\fscy115)" +
-                ("\\t(" + str(in_ms + steady_ms) + "," + str(in_ms + steady_ms + out_ms) + ",\\fscx100\\fscy100)" if out_ms>0 else "") +
-                "}" + w
-            )
-        else:
-            parts.append("{\\alpha&HFF&}" + w)
-        if j < n - 1:
-            parts.append(" ")
+    # Pour chaque mot i, on crée un "événement" ASS couvrant [start_i, end_i]
+    # Texte = derniers (window_size-1) mots + mot courant, avec le courant en couleur active + gras
+    # On évite les retours à la ligne pour limiter les sauts.
+    for i, (word, s, e) in enumerate(seq):
+        start_i, end_i = s, e
+        left = max(0, i - (window_size - 1))
+        visible = [w for (w, _, _) in seq[left:i]]   # anciens
+        before = " ".join(visible)
+        before = _escape_ass(before)
 
-    text = "".join(parts)
-    return (
-        f"Dialogue: 1,{_ass_time(w_start)},{_ass_time(w_end)},{st.name},"
-        f"{{\\an{st.align}\\fs{st.size}}}{text}"
-    )
+        active = _escape_ass(word)
+        # autres (blanc) / actif (jaune, gras)
+        txt_parts = []
+        if before:
+            txt_parts.append(r"{\1c" + style.primary + r"\b0}" + before + " ")
+        txt_parts.append(r"{\1c" + style.active + r"\b1}" + active + r"{\b0}")
+        # Pas d’anticipation du mot suivant -> moins de jitter
 
-def build_ass_from_srt(srt_text: str, preset: str = "default") -> str:
+        joined = "".join(txt_parts)
+        ass_text = f"{{\\an{style.align}}}{joined}"
+        out_lines.append(f"Dialogue: 0,{_ass_time(start_i)},{_ass_time(end_i)},{style.name},{ass_text}")
+
+    return "\n".join(out_lines)
+
+def build_ass_from_srt(srt_or_json: str, preset: str = "default") -> str:
     st = PRESETS.get((preset or "default").strip().lower(), PRESETS["default"])
     header = ASS_HEADER_TMPL.format(
         name=st.name, font=st.font, size=st.size,
-        primary=st.primary, outline_col=st.outline_col, back=st.back,
-        outline=st.outline, shadow=st.shadow, align=st.align, margin_v=st.margin_v
+        primary=st.primary, back=st.back, outline=st.outline, shadow=st.shadow,
+        align=st.align, margin_v=st.margin_v
     )
 
-    events = []
-    for block in _srt_blocks(srt_text):
-        start, end = _parse_times(block)
-        if start is None:
-            continue
-        sentence = _clean_text_lines(block)
-        if not sentence:
-            continue
+    # Détection JSON { "words": [...] }
+    is_json = False
+    try:
+        obj = json.loads(srt_or_json)
+        is_json = isinstance(obj, dict) and "words" in obj
+    except Exception:
+        is_json = False
 
-        words = re.findall(r"\S+", sentence)
+    if is_json:
+        body = words_json_to_ass(srt_or_json, st, window_size=5)
+    else:
+        body = srt_to_ass_lines(srt_or_json, st)
 
-        # 1) phrase de base (blanc)
-        events.append(_base_sentence_line(sentence, start, end, st))
-
-        # 2) overlays mot par mot (jaune + pop)
-        for i in range(len(words)):
-            events.append(_overlay_word_line(words, i, start, end, st))
-
-    return header + "\n".join(events) + "\n"
+    return header + body
