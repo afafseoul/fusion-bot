@@ -1,10 +1,8 @@
-# /opt/fusion-bot/captions.py
-# Accepte srt_text = JSON complet (avec "words": [...]) OU juste un array words[] (repr Make ou JSON).
+# captions.py — INPUT: srt_text = full JSON from Make (task, text, words[])
+# Extract only "words" array and generate ASS subtitles
 
 from dataclasses import dataclass
 import html, json, ast, re
-
-__all__ = ["build_ass_from_srt"]  # <-- garantit l’export
 
 @dataclass
 class CapStyle:
@@ -13,10 +11,10 @@ class CapStyle:
     size: int = 64
     outline: int = 4
     shadow: int = 2
-    align: int = 2           # 2 = bas-centre
+    align: int = 2           # 2 = bottom center
     margin_v: int = 120
-    primary: str = "&H00FFFFFF&"   # blanc
-    active:  str = "&H0000FFFF&"   # jaune
+    primary: str = "&H00FFFFFF&"   # white
+    active:  str = "&H0000FFFF&"   # yellow
     back:    str = "&H80000000&"
 
 STYLE = CapStyle()
@@ -46,6 +44,39 @@ def _escape(text: str) -> str:
     text = html.unescape(text or "")
     return text.replace("{", r"\{").replace("}", r"\}")
 
+def _parse_words(payload: str):
+    """Accept raw words[] OR full Whisper JSON with 'words' key."""
+    if not payload:
+        return []
+    txt = payload.strip()
+
+    # JSON input
+    try:
+        obj = json.loads(txt)
+        if isinstance(obj, list):
+            return _clean(obj)
+        if isinstance(obj, dict) and isinstance(obj.get("words"), list):
+            return _clean(obj["words"])
+    except:
+        pass
+
+    # Python repr input
+    try:
+        obj = ast.literal_eval(txt)
+        if isinstance(obj, list):
+            return _clean(obj)
+        if isinstance(obj, dict) and isinstance(obj.get("words"), list):
+            return _clean(obj["words"])
+    except:
+        pass
+
+    # Regex fallback
+    pairs = re.findall(
+        r"word['\"]?\s*:\s*['\"]([^'^\"]+)['\"].*?start['\"]?\s*:\s*([0-9.]+).*?end['\"]?\s*:\s*([0-9.]+)",
+        txt, flags=re.I|re.S
+    )
+    return _clean([{"word": w, "start": float(s), "end": float(e)} for (w,s,e) in pairs])
+
 def _clean(arr):
     out = []
     for w in arr:
@@ -56,66 +87,24 @@ def _clean(arr):
             if not word: continue
             if en <= st: en = st + 0.05
             out.append({"word": word, "start": st, "end": en})
-        except Exception:
+        except:
             continue
     out.sort(key=lambda x: (x["start"], x["end"]))
     return out
-
-def _parse_words(payload: str):
-    """
-    payload = string venant de Make.
-    - Peut être le JSON complet: {"task": "...", "words":[...], ...}
-    - Ou directement l'array words[] (JSON ou repr Python).
-    """
-    if not payload:
-        return []
-
-    txt = payload.strip()
-
-    # 0) JSON complet -> extraire .words si présent
-    try:
-        obj = json.loads(txt)
-        if isinstance(obj, dict) and "words" in obj and isinstance(obj["words"], list):
-            return _clean(obj["words"])
-        if isinstance(obj, list):
-            return _clean(obj)
-    except Exception:
-        pass
-
-    # 1) repr Python (Array Make)
-    try:
-        obj = ast.literal_eval(txt)
-        if isinstance(obj, dict) and "words" in obj and isinstance(obj["words"], list):
-            return _clean(obj["words"])
-        if isinstance(obj, list):
-            return _clean(obj)
-    except Exception:
-        pass
-
-    # 2) Tolérance minimale (regexp)
-    pairs = re.findall(
-        r"word['\"]?\s*:\s*['\"]([^'^\"]+)['\"].*?start['\"]?\s*:\s*([0-9.]+).*?end['\"]?\s*:\s*([0-9.]+)",
-        txt, flags=re.I|re.S
-    )
-    return _clean([{"word": w, "start": float(s), "end": float(e)} for (w,s,e) in pairs])
 
 def _window_line(words, i, window=5):
     a = max(0, i - (window - 1))
     chunk = []
     for j, w in enumerate(words[a:i+1]):
         tok = _escape(w["word"])
-        if j == len(words[a:i+1]) - 1:    # mot courant en surbrillance
+        if j == len(words[a:i+1]) - 1:  # highlighted current word
             chunk.append(f"{{\\c{STYLE.active}\\b1}}{tok}{{\\c{STYLE.primary}\\b0}}")
         else:
             chunk.append(tok)
     return " ".join(chunk)
 
 def build_ass_from_srt(srt_text: str, preset: str = "default") -> str:
-    """
-    API attendue par main.py
-    - srt_text = JSON complet (avec "words": [...]) OU array words[].
-    - Retourne le contenu d’un fichier .ass (une ligne par mot, fenêtre glissante).
-    """
+    """Interpret srt_text as Whisper words JSON (not SRT)."""
     words = _parse_words(srt_text or "")
     if not words:
         return ASS_HEADER
@@ -129,6 +118,8 @@ def build_ass_from_srt(srt_text: str, preset: str = "default") -> str:
             if en <= st: en = st + 0.03
         else:
             en = w["end"]
+
         text = _window_line(words, i, window=5)
         lines.append(f"Dialogue: 0,{_ass_time(st)},{_ass_time(en)},{STYLE.name},{{\\an{STYLE.align}}}{text}")
+
     return ASS_HEADER + "\n".join(lines)
