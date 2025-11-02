@@ -1,4 +1,4 @@
-# captions.py — One word at a time, HUGE, dead-center, yellow with black outline.
+# captions.py — One word at a time, CENTER, YELLOW, with "pop" animation.
 
 from dataclasses import dataclass
 import html, json, ast, re
@@ -7,14 +7,12 @@ import html, json, ast, re
 class CapStyle:
     name: str = "default"
     font: str = "DejaVu Sans Bold"
-    size: int = 220              # très grand pour 1080x1920
-    outline: int = 10            # contour épais
-    shadow: int = 0              # pas d'ombre
-    align: int = 5               # centre (ASS)
-    margin_v: int = 0
-    primary: str = "&H0000FFFF&"         # jaune  (AA BB GG RR -> 00 00 FF FF)
-    outline_colour: str = "&H00000000&"  # noir
-    back: str = "&H00000000&"            # non utilisé (BorderStyle 1)
+    size: int = 260          # taille énorme (augmente si tu veux encore plus)
+    outline: int = 12        # contour noir épais
+    shadow: int = 0
+    align: int = 5           # centre
+    primary: str = "&H0000FFFF&"   # JAUNE (BGR: 00FFFF)
+    outline_colour: str = "&H00000000&"  # NOIR
 
 STYLE = CapStyle()
 
@@ -25,7 +23,7 @@ PlayResY: 1920
 
 [V4+ Styles]
 ; Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-Style: {STYLE.name},{STYLE.font},{STYLE.size},{STYLE.primary},&H00000000,{STYLE.outline_colour},{STYLE.back},-1,0,0,0,100,100,0,0,1,{STYLE.outline},{STYLE.shadow},{STYLE.align},60,60,{STYLE.margin_v},1
+Style: {STYLE.name},{STYLE.font},{STYLE.size},{STYLE.primary},&H00000000,{STYLE.outline_colour},&H00000000,-1,0,0,0,100,100,0,0,1,{STYLE.outline},{STYLE.shadow},{STYLE.align},60,60,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Text
@@ -39,11 +37,11 @@ def _ass_time(t: float) -> str:
     cs = int(round((t - s) * 100))
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
-def _escape(text: str) -> str:
-    text = html.unescape(text or "")
-    return text.replace("{", r"\{").replace("}", r"\}")
+def _escape(s: str) -> str:
+    s = html.unescape(s or "")
+    return s.replace("{", r"\{").replace("}", r"\}")
 
-# --- Parse srt_text venant de Make (array words[] OU JSON complet) ---
+# --- accepte un ARRAY words[] ou un JSON complet {"words":[...]} ---
 def _parse_words_payload(payload: str):
     if not payload: return []
     txt = (payload or "").strip()
@@ -58,7 +56,7 @@ def _parse_words_payload(payload: str):
     except Exception:
         pass
 
-    # literal_eval (repr Python)
+    # literal_eval
     try:
         obj = ast.literal_eval(txt)
         if isinstance(obj, dict) and isinstance(obj.get("words"), list):
@@ -68,7 +66,7 @@ def _parse_words_payload(payload: str):
     except Exception:
         pass
 
-    # extraction tolérante du bloc "words":[...]
+    # extraction tolérante du bloc words
     try:
         m = re.search(r'"?words"?\s*:\s*(\[[\s\S]*?\])', txt, flags=re.I)
         if m:
@@ -78,7 +76,7 @@ def _parse_words_payload(payload: str):
     except Exception:
         pass
 
-    # fallback: triplets word/start/end
+    # fallback
     pairs = re.findall(
         r"word['\"]?\s*:\s*['\"]([^'^\"]+)['\"].*?start['\"]?\s*:\s*([0-9.]+).*?end['\"]?\s*:\s*([0-9.]+)",
         txt, flags=re.I|re.S
@@ -103,12 +101,15 @@ def _clean(arr):
 
 def build_ass_from_srt(srt_text: str, preset: str = "default") -> str:
     """
-    Utilisé par main.py. Rend **un seul mot** au centre, énorme.
-    srt_text = array words[] ou JSON complet contenant 'words'.
+    Utilisé par main.py. Affiche UN mot à la fois, centré, jaune,
+    avec animation "pop" (zoom puis retour).
     """
     words = _parse_words_payload(srt_text or "")
     if not words:
         return ASS_HEADER
+
+    # position exacte centre pour 1080x1920
+    pos = r"\pos(540,960)"
 
     lines = []
     n = len(words)
@@ -121,10 +122,17 @@ def build_ass_from_srt(srt_text: str, preset: str = "default") -> str:
 
         text = _escape(w["word"])
 
-        # On force position et style au runtime pour être SÛR du centre et de la taille
-        # \pos(540,960) = centre exact pour 1080x1920
-        # \fs = taille police, \bord = contour, \shad = ombre (0)
-        override = f"{{\\an5\\pos(540,960)\\fs{STYLE.size}\\bord{STYLE.outline}\\shad{STYLE.shadow}}}"
+        # Couleurs forcées + animation:
+        # départ à 80% -> sur-zoom 118% (0-120ms) -> retour 100% (120-260ms)
+        override = (
+            "{\\an5" + pos +
+            f"\\fs{STYLE.size}\\bord{STYLE.outline}\\shad{STYLE.shadow}" +
+            "\\1c&H00FFFF&\\3c&H000000&" +     # JAUNE fill, contour NOIR
+            "\\fscx80\\fscy80" +
+            "\\t(0,120,\\fscx118\\fscy118)" +
+            "\\t(120,260,\\fscx100\\fscy100)}"
+        )
+
         lines.append(f"Dialogue: 0,{_ass_time(st)},{_ass_time(en)},{STYLE.name},{override}{text}")
 
     return ASS_HEADER + "\n".join(lines)
