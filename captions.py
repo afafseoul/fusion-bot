@@ -1,5 +1,6 @@
 # /opt/fusion-bot/captions.py
-# srt_text = JSON complet (avec "words":[...]) OU directement un array words[].
+# srt_text = JSON complet (avec "words":[...]) OU juste un array words[].
+# Génère un .ass avec un mot à la fois, centré, jaune.
 
 from dataclasses import dataclass
 import html, json, ast, re
@@ -9,16 +10,18 @@ __all__ = ["build_ass_from_srt"]
 @dataclass
 class CapStyle:
     name: str = "default"
-    # Police type "CapCut"
-    font: str = "Arial Black"
-    # Avant on était à ~240 -> on réduit d’environ 40 %
-    size: int = 144
-    outline: int = 10
-    shadow: int = 0
-    align: int = 5           # centre
-    margin_v: int = 0
-    primary: str = "&H0000FFFF&"        # jaune (BGR)
-    back:    str = "&H00000000&"
+    # garde une police sûre côté serveur ; tu pourras changer le nom si tu as une autre font installée
+    font: str = "DejaVu Sans"
+    # taille globale (≈ 40% plus petit que ton ancien 64)
+    size: int = 40
+    outline: int = 4
+    shadow: int = 2
+    # 5 = centre ; (2 = bas centre que tu avais)
+    align: int = 5           # milieu-centre
+    margin_v: int = 0        # 0 => vraiment au centre vertical
+    primary: str = "&H00000000&"   # noir (texte)
+    active:  str = "&H0000FFFF&"   # jaune (non utilisé ici car un seul mot)
+    back:    str = "&H80FFFF00&"   # fond jaune semi-transparent
 
 STYLE = CapStyle()
 
@@ -28,18 +31,20 @@ PlayResX: 1080
 PlayResY: 1920
 
 [V4+ Styles]
-; Format: Name,Fontname,Fontsize,PrimaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-Style: {STYLE.name},{STYLE.font},{STYLE.size},{STYLE.primary},&H00000000,{STYLE.back},-1,0,0,0,100,100,0,0,1,{STYLE.outline},{STYLE.shadow},{STYLE.align},60,60,{STYLE.margin_v},1
+Format: Name,Fontname,Fontsize,PrimaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: {STYLE.name},{STYLE.font},{STYLE.size},{STYLE.primary},&H00000000,{STYLE.back},-1,0,0,0,100,100,0,0,3,{STYLE.outline},{STYLE.shadow},{STYLE.align},60,60,{STYLE.margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Text
 """
 
+# ------------ utils temps & parsing ------------
+
 def _ass_time(t: float) -> str:
     if t < 0:
         t = 0.0
-    h = int(t // 3600); t -= 3600*h
-    m = int(t // 60);   t -= 60*m
+    h = int(t // 3600); t -= 3600 * h
+    m = int(t // 60);   t -= 60 * m
     s = int(t)
     cs = int(round((t - s) * 100))
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
@@ -47,23 +52,6 @@ def _ass_time(t: float) -> str:
 def _escape(text: str) -> str:
     text = html.unescape(text or "")
     return text.replace("{", r"\{").replace("}", r"\}")
-
-def _clean(arr):
-    out = []
-    for w in arr:
-        try:
-            word = str(w.get("word", "")).strip()
-            st   = float(w.get("start", 0.0))
-            en   = float(w.get("end",   st + 0.05))
-            if not word:
-                continue
-            if en <= st:
-                en = st + 0.05
-            out.append({"word": word, "start": st, "end": en})
-        except Exception:
-            continue
-    out.sort(key=lambda x: (x["start"], x["end"]))
-    return out
 
 def _parse_words(payload: str):
     """
@@ -96,53 +84,112 @@ def _parse_words(payload: str):
     except Exception:
         pass
 
-    # 2) regexp tolérante
+    # 2) Regex tolérante
     pairs = re.findall(
         r"word['\"]?\s*:\s*['\"]([^'^\"]+)['\"].*?start['\"]?\s*:\s*([0-9.]+).*?end['\"]?\s*:\s*([0-9.]+)",
         txt, flags=re.I | re.S
     )
     return _clean([{"word": w, "start": float(s), "end": float(e)} for (w, s, e) in pairs])
 
+def _clean(arr):
+    """
+    Normalise + répare les timings pour avoir:
+      - ordre correct
+      - durée mini par mot
+      - pas de recouvrement hardcore
+    """
+    raw = []
+    for w in arr:
+        try:
+            word = str(w.get("word", "")).strip()
+            st = float(w.get("start", 0.0))
+            en = float(w.get("end", st))
+            raw.append({"word": word, "start": st, "end": en})
+        except Exception:
+            continue
+
+    # filtre les vides
+    raw = [w for w in raw if w["word"]]
+    if not raw:
+        return []
+
+    # tri par start
+    raw.sort(key=lambda x: (x["start"], x["end"]))
+
+    # paramètres de smoothing
+    MIN_DUR = 0.16   # durée min "confortable" ~ 160 ms
+    MIN_GAP = 0.01   # petit gap entre deux mots
+
+    # 1ère passe : garantir ordre & gap
+    for i, w in enumerate(raw):
+        if i == 0:
+            if w["end"] <= w["start"]:
+                w["end"] = w["start"] + MIN_DUR
+            continue
+
+        prev = raw[i - 1]
+
+        # start ne doit pas revenir en arrière
+        if w["start"] < prev["start"]:
+            w["start"] = prev["start"]
+
+        # évite chevauchement violent
+        if w["start"] < prev["end"] + MIN_GAP:
+            w["start"] = prev["end"] + MIN_GAP
+
+        if w["end"] <= w["start"]:
+            w["end"] = w["start"] + MIN_DUR
+
+    # 2ème passe : durée minimale par mot,
+    # sans décaler les starts suivants (on borne avec le start du mot suivant)
+    n = len(raw)
+    for i, w in enumerate(raw):
+        desired_end = w["start"] + MIN_DUR
+        if w["end"] >= desired_end:
+            continue  # déjà assez long
+
+        if i < n - 1:
+            next_start = raw[i + 1]["start"]
+            # on garde un petit gap avant le mot suivant
+            max_end = max(w["start"] + 0.05, next_start - MIN_GAP)
+            w["end"] = min(desired_end, max_end)
+            # si malgré tout ça reste trop court (phrase super serrée),
+            # on laisse au moins quelque chose de visible
+            if w["end"] <= w["start"]:
+                w["end"] = w["start"] + MIN_DUR * 0.6
+        else:
+            # dernier mot : on peut l'étendre librement
+            w["end"] = desired_end
+
+    return raw
+
+# ------------ génération ASS ------------
+
 def build_ass_from_srt(srt_text: str, preset: str = "default") -> str:
     """
+    API attendue par main.py
     - srt_text = JSON complet (avec "words": [...]) OU array words[].
-    - 1 mot à la fois, centré, jaune, anim pop courte.
+    - Retourne un .ass : un mot à la fois, centré, fond jaune.
     """
     words = _parse_words(srt_text or "")
     if not words:
         return ASS_HEADER
 
     lines = []
-    n = len(words)
-    pos = r"\pos(540,960)"  # centre 1080x1920
-
-    for i, w in enumerate(words):
+    for w in words:
         st = w["start"]
         en = w["end"]
-        if i < n - 1:
-            en = min(en, words[i + 1]["start"] - 0.01)
-            if en <= st:
-                en = st + 0.03
+        tok = _escape(w["word"])
 
-        text = _escape(w["word"])
-
-        # scale constant pour tous les mots (plus petit qu’avant)
-        start_scale = 90    # 0 ms
-        peak_scale  = 105   # 0–70 ms
-        final_scale = 100   # 70–160 ms
-
-        override = (
-            "{\\an5" + pos +
-            f"\\fs{STYLE.size}\\bord{STYLE.outline}\\shad{STYLE.shadow}" +
-            "\\1c&H00FFFF&\\3c&H000000&" +          # jaune + contour noir
-            f"\\fscx{start_scale}\\fscy{start_scale}" +
-            f"\\t(0,70,\\fscx{peak_scale}\\fscy{peak_scale})" +
-            f"\\t(70,160,\\fscx{final_scale}\\fscy{final_scale})" +
-            "}"
+        # style "pancarte" : fond jaune + texte noir, centré
+        ass_text = (
+            "{\\an" + str(STYLE.align) +
+            "\\bord" + str(STYLE.outline) +
+            "\\shad" + str(STYLE.shadow) +
+            "}" + tok
         )
 
-        lines.append(
-            f"Dialogue: 0,{_ass_time(st)},{_ass_time(en)},{STYLE.name},{override}{text}"
-        )
+        line = f"Dialogue: 0,{_ass_time(st)},{_ass_time(en)},{STYLE.name},,{ass_text}"
+        lines.append(line)
 
     return ASS_HEADER + "\n".join(lines)
