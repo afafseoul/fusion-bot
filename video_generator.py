@@ -49,15 +49,21 @@ def _download(url: str, dst_noext: str, logger: logging.Logger, req_id: str) -> 
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=45) as r:
         ct = (r.info().get_content_type() or "").lower()
-        if "gif" in ct: ext = ".gif"
-        elif "mp4" in ct or "video/" in ct: ext = ".mp4"
+        if "gif" in ct:
+            ext = ".gif"
+        elif "mp4" in ct or "video/" in ct:
+            ext = ".mp4"
         else:
             low = url.lower()
-            if ".gif" in low: ext = ".gif"
-            elif ".mp4" in low: ext = ".mp4"
-            else: ext = ".bin"
+            if ".gif" in low:
+                ext = ".gif"
+            elif ".mp4" in low:
+                ext = ".mp4"
+            else:
+                ext = ".bin"
         dst = dst_noext + ext
-        with open(dst, "wb") as f: shutil.copyfileobj(r, f)
+        with open(dst, "wb") as f:
+            shutil.copyfileobj(r, f)
     if os.path.getsize(dst) <= 0:
         raise RuntimeError("downloaded file is empty")
     if dst.endswith(".bin"):
@@ -89,12 +95,6 @@ def _encode_segment_default(src: str, dst: str, need_dur: float, width: int, hei
     else:
         in_flags = f'-stream_loop -1 -t {need_dur:.3f} -i {shlex.quote(src)}'
 
-    # Chaîne de filtres :
-    # 1) setsar=1 pour fiabiliser iw/ih
-    # 2) crop carré S = min(iw,ih) (centré)
-    # 3) re-crop conditionnel à "box" si S > box (donc jamais de downscale)
-    # 4) scale conditionnel d'UPSCALE uniquement si S < box (pour garder un carré constant plein)
-    # 5) pad en WxH centré + fps + format
     vf = ",".join([
         "setsar=1",
         "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2'",
@@ -148,7 +148,8 @@ def _encode_segment_with_style(src: str, dst: str, need_dur: float, width: int, 
 def _concat_copy_strict(parts: List[str], out_path: str, logger: logging.Logger, req_id: str) -> str:
     list_path = out_path + ".txt"
     with open(list_path, "w") as f:
-        for p in parts: f.write(f"file '{os.path.abspath(p)}'\n")
+        for p in parts:
+            f.write(f"file '{os.path.abspath(p)}'\n")
     cmd = ("ffmpeg -y -hide_banner -loglevel error "
            f"-f concat -safe 0 -i {shlex.quote(list_path)} "
            "-fflags +genpts -avoid_negative_ts make_zero "
@@ -167,10 +168,11 @@ def _concat_copy_strict(parts: List[str], out_path: str, logger: logging.Logger,
         _run(_with_threads(cmd2), logger, req_id); return "concat_filter"
 
 def _mux_audio(video_path: str, audio_path: str, out_path: str, logger: logging.Logger, req_id: str):
+    # ⚠️ SUPPRESSION DE -shortest pour ne plus couper la vidéo trop tôt
     cmd = ("ffmpeg -y -hide_banner -loglevel error "
            f"-i {shlex.quote(video_path)} -i {shlex.quote(audio_path)} "
            "-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k "
-           "-shortest -movflags +faststart "
+           "-movflags +faststart "
            f"{shlex.quote(out_path)}")
     _run(_with_threads(cmd), logger, req_id)
 
