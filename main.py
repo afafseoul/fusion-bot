@@ -242,8 +242,8 @@ def create_video():
         audio_file = request.files["audio_file"]
 
         style           = request.form.get("style", "default")
-        caption_style = request.form.get("caption_style")
-        srt_text      = request.form.get("srt_text")
+        caption_style   = request.form.get("caption_style")
+        srt_text        = request.form.get("srt_text")
         music_folder_id = request.form.get("music_folder_id")
         music_volume    = _parse_float(request.form.get("music_volume", 0.25), 0.25)
         drive_folder_id = request.form.get("drive_folder_id") or request.args.get("drive_folder_id")
@@ -252,6 +252,12 @@ def create_video():
         compte          = request.form.get("compte") or request.args.get("compte")
         # 🆕 narration passée depuis Make (clé exactement "Contenue")
         contenue        = request.form.get("Contenue") or request.args.get("Contenue")
+
+        # 🔀 NOUVEAU : permettre de désactiver les captions avec "0", "false", "off", "none", "no"
+        if caption_style is not None:
+            cs_norm = str(caption_style).strip().lower()
+            if cs_norm in ("0", "false", "off", "none", "no"):
+                caption_style = ""
 
         app.logger.info(f"[{g.req_id}] fields ok name={output_name} {width}x{height}@{fps} "
                         f"audio={getattr(audio_file,'filename',None)} style={style}")
@@ -427,6 +433,13 @@ def _worker_create_video(jid: str, fields: Dict[str, Any]):
         try:
             caption_style = fields.get("caption_style")
             srt_text = fields.get("srt_text")
+
+            # 🔀 NOUVEAU : même logique de désactivation pour l'async
+            if isinstance(caption_style, str):
+                cs_norm = caption_style.strip().lower()
+                if cs_norm in ("0", "false", "off", "none", "no"):
+                    caption_style = ""
+
             if caption_style and srt_text:
                 ass_path = os.path.join(workdir if workdir else os.path.dirname(out_path), "captions.ass")
                 ass_text = build_ass_from_srt(srt_text, preset=caption_style)
