@@ -87,13 +87,22 @@ def _encode_segment_default(src: str, dst: str, need_dur: float, width: int, hei
     box = min(width, height)  # 1080 pour 1080x1920
     src_low = src.lower()
 
+    # --- SEULE PARTIE MODIFIÉE : on s'assure que les GIF bouclent aussi jusqu'à need_dur ---
     if src_low.startswith("http") and ".m3u8" in src_low:
-        in_flags = ('-protocol_whitelist "file,http,https,tcp,tls,crypto" '
-                    f'-t {need_dur:.3f} -i {shlex.quote(src)}')
+        in_flags = (
+            '-protocol_whitelist "file,http,https,tcp,tls,crypto" '
+            f'-t {need_dur:.3f} -i {shlex.quote(src)}'
+        )
     elif src_low.endswith(".gif"):
-        in_flags = f'-ignore_loop 0 -t {need_dur:.3f} -i {shlex.quote(src)}'
+        # on ignore le loop interne du GIF et on force un loop infini, puis on coupe à need_dur
+        in_flags = (
+            f'-ignore_loop 0 -stream_loop -1 -t {need_dur:.3f} '
+            f'-i {shlex.quote(src)}'
+        )
     else:
+        # MP4 / autres vidéos : loop infini puis coupure à need_dur
         in_flags = f'-stream_loop -1 -t {need_dur:.3f} -i {shlex.quote(src)}'
+    # --- FIN MODIF ---
 
     vf = ",".join([
         "setsar=1",
